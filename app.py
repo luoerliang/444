@@ -32,6 +32,36 @@ def tg():
     if p: save(*p)
   except Exception: time.sleep(5)
 
+def parse_embedded_history(raw):
+    """从页面原始HTML/内联JS中的 JSON/对象数据提取3分彩历史。"""
+    if not raw:
+        return []
+    out=[]
+    # 常见JSON键名：expect/issue + openCode/open_code/opencode
+    patterns = [
+        r'["\']expect["\']\s*:\s*["\'](20\d{9})["\'][\s\S]{0,500}?["\']openCode["\']\s*:\s*["\']([^"\']+)["\']',
+        r'["\']issue["\']\s*:\s*["\'](20\d{9})["\'][\s\S]{0,500}?["\'](?:openCode|open_code|opencode)["\']\s*:\s*["\']([^"\']+)["\']',
+        r'expect\s*:\s*["\'](20\d{9})["\'][\s\S]{0,500}?(?:openCode|open_code|opencode)\s*:\s*["\']([^"\']+)["\']',
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, raw, re.I):
+            issue=m.group(1); code=m.group(2)
+            nums=[]
+            for q in re.findall(r'\d{1,2}',code):
+                n=int(q)
+                if 1<=n<=49 and n not in nums: nums.append(n)
+            if len(nums)>=7 and len(set(nums[:7]))==7:
+                out.append((issue,nums[:7]))
+    # 有些页面把期号和7个号码作为连续文本写进JS
+    for m in re.finditer(r'(20\d{9})[\s\S]{0,220}?(?<!\d)(0?[1-9]|[1-4]\d|49)(?:\D+)(0?[1-9]|[1-4]\d|49)(?:\D+)(0?[1-9]|[1-4]\d|49)(?:\D+)(0?[1-9]|[1-4]\d|49)(?:\D+)(0?[1-9]|[1-4]\d|49)(?:\D+)(0?[1-9]|[1-4]\d|49)(?:\D+)(0?[1-9]|[1-4]\d|49)', raw):
+        issue=m.group(1); ns=[int(x) for x in m.groups()[1:]]
+        if len(set(ns))==7: out.append((issue,ns))
+    seen=set(); clean=[]
+    for x in out:
+        if x[0] not in seen:
+            seen.add(x[0]); clean.append(x)
+    return clean
+
 def parse_web_history(html):
     """稳健解析3分彩历史页：按表格行识别期号，并从该行末尾提取7个开奖号码。"""
     out=[]
@@ -92,7 +122,7 @@ def fetch_history_page(page):
         try:
             req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Safari/605.1','Accept':'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8','Accept-Language':'zh-CN,zh;q=0.9'})
             with urllib.request.urlopen(req,timeout=18) as r: html=r.read().decode('utf-8','ignore')
-            got=parse_web_history(html) or parse_text_history(html)
+            got=parse_embedded_history(html) or parse_web_history(html) or parse_text_history(html)
             if got: return got
         except Exception: continue
     return []
@@ -168,22 +198,29 @@ def fetch_api_history(year):
     return []
 
 def fetch_issue_api(issue):
-    """按3分彩完整期号兜底查询；用于历史分页/API不可用时逐期补齐。"""
+    """逐期查询3分彩；同时尝试官方历史路径、当前接口查询参数和公共代理。"""
     urls=[
         f'https://history.macaumarksix.com/history/macaujc3/expect/{issue}',
-        f'https://macaumarksix.com/api/macaujc3/expect/{issue}',
+        f'https://history.macaumarksix.com/history/macaujc3/{issue}',
+        f'https://macaumarksix.com/api/macaujc3.com?expect={issue}',
+        f'https://macaumarksix.com/api/macaujc3.com?number={issue}',
+        f'https://macaumarksix.com/api/macaujc3.com?issue={issue}',
     ]
     for url in urls:
         try:
             req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*'})
-            with urllib.request.urlopen(req,timeout=6) as r:
-                data=json.loads(r.read().decode('utf-8','ignore'))
-            got=parse_api_history(data)
-            if got:
-                return got[0]
+            with urllib.request.urlopen(req,timeout=7) as r:
+                raw=r.read().decode('utf-8','ignore')
+            try:
+                data=json.loads(raw); got=parse_api_history(data)
+            except Exception:
+                got=parse_embedded_history(raw) or parse_text_history(raw)
+            for item in got:
+                if item[0]==issue: return item
         except Exception:
             continue
     return None
+
 
 def fetch_current_api():
     """3分彩专用当前接口；只接受 YYYYMMDDNNN 期号。"""
@@ -200,65 +237,61 @@ def fetch_current_api():
     return None
 
 def web_backfill():
-    """历史主源=3分彩专用API；网页分页/逐期API/直播页均为备用。"""
+    """严格按本周期001→当前期补齐；只有完整连续历史才用于预测。"""
     while True:
-        reached=False
         try:
             target=datetime.now(BJ).strftime('%Y%m%d')
-            # ① 一次性拉全年3分彩历史（真正关键的修复）
+            # 先用当前接口确定真正的当前期，不再写死211。
+            curitem=fetch_current_api()
+            current_num=int(curitem[0][-3:]) if curitem and curitem[0].startswith(target) else 0
+            if curitem and curitem[0].startswith(target): save(curitem[0],curitem[1])
+
+            # 年度历史接口/页面/内嵌JS先尽量一次性导入。
             got=fetch_api_history(datetime.now(BJ).year)
             for issue,ns in got:
                 if issue.startswith(target): save(issue,ns)
-                if issue==target+'001': reached=True
+            for page in range(1,61):
+                got=fetch_history_page(page)
+                for issue,ns in got:
+                    if issue.startswith(target):
+                        save(issue,ns)
+                        if issue[-3:].isdigit(): current_num=max(current_num,int(issue[-3:]))
 
-            # ② 如果全年接口在当前网络不可用，则并发逐期查询001~当前。
-            if not reached:
+            # 再检查数据库，确定应该补到哪里。
+            ds=draws()
+            nums=sorted({int(d['issue'][-3:]) for d in ds if d['issue'].startswith(target) and d['issue'][-3:].isdigit()})
+            if nums: current_num=max(current_num,max(nums))
+            if current_num<=0: current_num=1
+            expected=set(range(1,current_num+1))
+            have=set(nums)
+            missing=sorted(expected-have)
+
+            # 只补缺号；避免每分钟重复请求全部历史。
+            if missing:
                 from concurrent.futures import ThreadPoolExecutor, as_completed
-                # 当前期号从数据库、Telegram、专用当前接口中取最大值；最低先补到300，接口不存在的会快速失败。
-                ds0=draws(); nums=[int(d['issue'][-3:]) for d in ds0 if d['issue'].startswith(target) and d['issue'][-3:].isdigit()]
-                cur=max(nums) if nums else 0
-                cur=max(cur,211)
-                issues=[f'{target}{i:03d}' for i in range(1,cur+1)]
-                with ThreadPoolExecutor(max_workers=24) as ex:
-                    futs=[ex.submit(fetch_issue_api,iss) for iss in issues]
+                with ThreadPoolExecutor(max_workers=20) as ex:
+                    futs={ex.submit(fetch_issue_api,f'{target}{i:03d}'):i for i in missing}
                     for f in as_completed(futs):
                         try:
                             item=f.result()
                             if item and item[0].startswith(target): save(item[0],item[1])
-                        except Exception: pass
-                ds1=draws()
-                reached=any(d['issue']==target+'001' for d in ds1)
+                        except Exception:
+                            pass
 
-            # ③ 当前专用API作为实时备用；绝不覆盖更新的Telegram数据。
-            curitem=fetch_current_api()
-            if curitem and curitem[0].startswith(target): save(curitem[0],curitem[1])
-
-            # ④ 网页历史分页：必须尽量扫完，不因为先遇到001或重复页就提前结束。
-            # 目的：补齐001~当前，而不是只拿到页面里能解析的几条。
-            seen_page_keys=set()
-            for page in range(1,101):
+            # 最后再扫一次页面，补充任何接口漏掉的期。
+            for page in range(1,61):
                 got=fetch_history_page(page)
-                if not got: continue
-                page_key=tuple(sorted(x[0] for x in got))
-                if page_key in seen_page_keys: continue
-                seen_page_keys.add(page_key)
                 for issue,ns in got:
                     if issue.startswith(target): save(issue,ns)
-                if any(x[0]==target+'001' for x in got): reached=True
-            if not reached:
-                for url in ['https://macaujc.com/open_video3/','https://r.jina.ai/http://macaujc.com/open_video3/','https://r.jina.ai/https://macaujc.com/open_video3/']:
-                    try:
-                        req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8'})
-                        with urllib.request.urlopen(req,timeout=15) as r: html=r.read().decode('utf-8','ignore')
-                        got=parse_web_history(html) or parse_text_history(html)
-                        for issue,ns in got:
-                            if issue.startswith(target): save(issue,ns)
-                            if issue==target+'001': reached=True
-                        if reached: break
-                    except Exception: continue
+
+            # 连续性状态由页面读取；如果001~当前全齐，就进入60秒检查，否则15秒重试。
+            ds=draws()
+            have2={int(d['issue'][-3:]) for d in ds if d['issue'].startswith(target) and d['issue'][-3:].isdigit()}
+            complete=current_num>0 and all(i in have2 for i in range(1,current_num+1))
+            time.sleep(60 if complete else 15)
         except Exception:
-            pass
-        time.sleep(30 if reached else 10)
+            time.sleep(15)
+
 
 def cycle_start_for(ds):
  # 本统计周期从当天001期开始；跨日后自动切换到新日期001期。
