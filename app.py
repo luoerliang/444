@@ -1,115 +1,115 @@
-import os,re,sqlite3,threading,time
-from datetime import datetime,timedelta,timezone
+import os, re, sqlite3, threading, time
+from datetime import datetime, timedelta, timezone
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor,as_completed
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask,render_template_string,jsonify
+from flask import Flask, jsonify, render_template_string
 
-app=Flask(__name__)
-DB=os.getenv('DB_PATH','macau3.db')
-TZ8=timezone(timedelta(hours=8))
-TOKEN=os.getenv('TELEGRAM_BOT_TOKEN','').strip()
-TG_API=f'https://api.telegram.org/bot{TOKEN}' if TOKEN else ''
-TG={'ok':False,'issue':'','time':'','error':'未开始'}
-SOURCES=['https://macaujc.com/open_video3/','http://macaujc.com/open_video3/','https://r.jina.ai/http://macaujc.com/open_video3/']
-HEAD={'User-Agent':'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1','Cache-Control':'no-cache','Pragma':'no-cache'}
-HTML='''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><title>澳门六合彩3分分析</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;background:#f5f6f8;margin:0;color:#222}.wrap{max-width:760px;margin:auto;padding:14px}.card{background:#fff;border-radius:14px;padding:16px;margin:10px 0;box-shadow:0 2px 10px #0001}h1{font-size:22px;margin:4px 0 8px}.muted{color:#777;font-size:13px}.nums{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}.ball{width:38px;height:38px;border-radius:50%;background:#eee;display:flex;align-items:center;justify-content:center;font-weight:700}.special{background:#222;color:#fff}.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.item{padding:10px;border:1px solid #eee;border-radius:10px;text-align:center}.big{font-size:19px;font-weight:700}.tag{font-size:12px;color:#777}.row{display:flex;justify-content:space-between;gap:8px}.copyrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.copybtn{border:0;padding:9px 12px;border-radius:9px;background:#111;color:#fff}.copynum{font-weight:700}.ok{color:#087f23}.err{color:#b00020}.btn{display:inline-block;padding:9px 12px;border-radius:9px;background:#111;color:#fff;text-decoration:none}.table{width:100%;border-collapse:collapse;font-size:13px}.table td{padding:8px 3px;border-bottom:1px solid #eee}</style></head><body><div class="wrap"><div class="card"><h1>澳门六合彩3分分析</h1><div class="muted">Telegram实时开奖 + 公开源补充 · 北京时间 UTC+8</div></div><div class="card"><div class="row"><b>最新开奖</b><span class="muted">{{lt}}</span></div><p><b>第{{li or '—'}}期</b></p><div class="nums">{% for n in lm %}<span class="ball">{{n}}</span>{% endfor %}{% if ls %}<span class="ball special">{{ls}}</span>{% endif %}</div><div class="muted">前6个为正码，黑色为特码</div></div><div class="card"><b>实时统计候选（仅统计，不保证结果）</b><p class="muted">按已收集的全部记录累计统计，最多22个号码。</p><div class="copyrow"><span class="copynum" id="ct">{{ct}}</span><button class="copybtn" onclick="navigator.clipboard.writeText(document.getElementById('ct').innerText).then(()=>alert('已复制'))">一键复制</button></div><div class="grid">{% for n,c in cs %}<div class="item"><div class="big">{{n}}</div><div class="tag">{{c}}分</div></div>{% endfor %}</div></div><div class="card"><b>Telegram实时接收状态</b><p class="{{'ok' if tgok else 'err'}}">{{tgs}}</p>{% if tgi %}<div class="muted">最后收到：第{{tgi}}期　{{tgt}}</div>{% endif %}</div><div class="card"><div class="row"><b>同步状态</b><span class="muted">{{now}}</span></div><p class="{{'err' if err else ''}}">{{status}}</p><a class="btn" href="/sync">立即同步</a></div><div class="card"><b>最近记录</b><table class="table"><tbody>{% for r in rs %}<tr><td>第{{r.issue}}期<br><span class="muted">{{r.time}}</span></td><td>{{' '.join(r.main)}} <b>+ {{r.special}}</b></td></tr>{% endfor %}</tbody></table></div></div></body></html>'''
+APP = Flask(__name__)
+DB = os.getenv('DB_PATH', 'macau3.db')
+SOURCE_URL = 'https://maoaujc.com/macaujc2//?id=3&page=3'
+TZ8 = timezone(timedelta(hours=8))
+HEADERS = {'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Safari/604.1'}
+
+HTML = '''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="60"><title>澳门六合彩3分分析</title><style>
+body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;background:#f5f6f8;margin:0;color:#222}.wrap{max-width:760px;margin:auto;padding:14px}.card{background:#fff;border-radius:14px;padding:16px;margin:10px 0;box-shadow:0 2px 10px #00000010}h1{font-size:22px;margin:4px 0 8px}.muted{color:#777;font-size:13px}.status{padding:9px 11px;border-radius:10px;background:#eef6ff;font-size:13px}.nums{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}.ball{width:38px;height:38px;border-radius:50%;background:#eee;display:flex;align-items:center;justify-content:center;font-weight:700}.special{background:#222;color:#fff}.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}.item{padding:10px;border:1px solid #eee;border-radius:10px;text-align:center}.tag{font-size:12px;color:#777}.big{font-size:19px;font-weight:700}.row{display:flex;justify-content:space-between;gap:8px}.table{width:100%;border-collapse:collapse;font-size:13px}.table td{padding:8px 3px;border-bottom:1px solid #eee}.right{text-align:right}.btn{display:inline-block;padding:9px 12px;border-radius:9px;background:#111;color:#fff;text-decoration:none}.warn{color:#a15c00}.err{color:#b00020}
+</style></head><body><div class="wrap"><div class="card"><h1>澳门六合彩3分分析</h1><div class="muted">数据源：澳门六合彩3分公开历史页 · 北京时间 UTC+8</div></div>
+<div class="card"><div class="row"><b>最新开奖</b><span class="muted">{{ latest_time }}</span></div><p><b>第{{ latest_issue or '—' }}期</b></p><div class="nums">{% for n in latest_main %}<span class="ball">{{n}}</span>{% endfor %}{% if latest_special %}<span class="ball special">{{latest_special}}</span>{% endif %}</div><div class="muted">前6个为正码，黑色为特码</div></div>
+<div class="card"><b>统计候选（仅统计，不保证结果）</b><p class="muted">根据最近 {{ sample_n }} 期号码频次，并对近期记录加权。</p><div class="grid">{% for n,c in candidates %}<div class="item"><div class="big">{{n}}</div><div class="tag">{{c}}分</div></div>{% endfor %}</div></div>
+<div class="card"><div class="row"><b>同步状态</b><span class="muted">{{ now }}</span></div><p class="{{'err' if error else ''}}">{{ status }}</p><a class="btn" href="/sync">立即同步</a></div>
+<div class="card"><b>最近记录</b><table class="table"><tbody>{% for r in rows %}<tr><td>第{{r.issue}}期<br><span class="muted">{{r.time}}</span></td><td>{{' '.join(r.main)}} <b>+ {{r.special}}</b></td></tr>{% endfor %}</tbody></table></div>
+</div></body></html>'''
 
 def db():
- c=sqlite3.connect(DB,timeout=30);c.row_factory=sqlite3.Row;return c
+    c=sqlite3.connect(DB); c.row_factory=sqlite3.Row; return c
 
-def init():
- c=db();c.execute('CREATE TABLE IF NOT EXISTS draws(issue TEXT PRIMARY KEY,open_time TEXT,nums TEXT,special TEXT)');c.commit();c.close()
+def init_db():
+    c=db(); c.execute('''CREATE TABLE IF NOT EXISTS draws(issue TEXT PRIMARY KEY, open_time TEXT, nums TEXT, special TEXT)'''); c.commit(); c.close()
 
-def infer(issue):
- try:
-  d=datetime.strptime(issue[:8],'%Y%m%d');s=int(issue[8:]);return (d+timedelta(minutes=max(0,(s-1)*3))).strftime('%Y-%m-%d %H:%M:%S')
- except:return None
+def clean_num(x):
+    m=re.search(r'(?<!\d)(\d{1,2})(?!\d)', x)
+    return f'{int(m.group(1)):02d}' if m else None
 
-def parse_tg(text):
- p=re.compile(r'(20\d{9})\s*(?:期开奖结果)\s*:?\s*((?:\d{1,2}\s+){6}\d{1,2})')
- out=[]
- for m in p.finditer(text or ''):
-  nums=[f'{int(x):02d}' for x in m.group(2).split()]
-  if len(nums)==7 and all(1<=int(x)<=49 for x in nums):out.append((m.group(1),infer(m.group(1)),nums[:6],nums[6]))
- return out
+def parse_source(html):
+    soup=BeautifulSoup(html,'html.parser')
+    text='\n'.join(s.strip() for s in soup.stripped_strings if s.strip())
+    # Use line-based parsing first: issue -> time -> 6 numbers -> + -> special.
+    lines=[x.strip() for x in soup.stripped_strings if x.strip()]
+    out=[]
+    for i,line in enumerate(lines):
+        im=re.fullmatch(r'第?(20\d{10})期?', line)
+        if not im: continue
+        issue=im.group(1)
+        window=lines[i+1:i+30]
+        ti=None; nums=[]; special=None
+        for j,x in enumerate(window):
+            tm=re.search(r'(20\d{2}[-/]\d{1,2}[-/]\d{1,2})\s+(\d{1,2}:\d{2}:\d{2})',x)
+            if tm: ti=tm.group(1).replace('/','-')+' '+tm.group(2); continue
+            if ti and re.fullmatch(r'\d{1,2}[\s\-]*[\u4e00-\u9fff]{0,3}',x):
+                n=clean_num(x)
+                if n: nums.append(n)
+                continue
+            if ti and x=='+':
+                for z in window[j+1:j+4]:
+                    n=clean_num(z)
+                    if n: special=n; break
+                break
+        if ti and len(nums)>=6 and special:
+            out.append((issue,ti,nums[:6],special))
+    # Fallback: regex on normalized text.
+    if not out:
+        t=' '.join(lines)
+        pat=re.compile(r'第(20\d{10})期.*?(20\d{2}[-/]\d{1,2}[-/]\d{1,2})\s+(\d{1,2}:\d{2}:\d{2}).*?(\d{1,2}).*?(\d{1,2}).*?(\d{1,2}).*?(\d{1,2}).*?(\d{1,2}).*?(\d{1,2}).*?\+.*?(\d{1,2})')
+        for m in pat.finditer(t):
+            out.append((m.group(1),m.group(2)+' '+m.group(3),[f'{int(m.group(k)):02d}' for k in range(4,10)],f'{int(m.group(10)):02d}'))
+    return out
 
-def parse_web(html):
- soup=BeautifulSoup(html,'html.parser');text=soup.get_text('\n',strip=True).replace('\xa0',' ');joined='\n'.join(x.strip() for x in text.splitlines() if x.strip());issues=list(re.finditer(r'20\d{9}',joined));out=[]
- combo=re.compile(r'(\d{1,2})\D{0,18}(\d{1,2})\D{0,18}(\d{1,2})\D{0,18}(\d{1,2})\D{0,18}(\d{1,2})\D{0,18}(\d{1,2})\D{0,25}\+\D{0,8}(\d{1,2})')
- tr=re.compile(r'(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})[日\sT]+(\d{1,2}):(\d{2})(?::(\d{2}))?')
- for i,m in enumerate(issues):
-  issue=m.group(0);w=joined[m.end():(issues[i+1].start() if i+1<len(issues) else min(len(joined),m.end()+2500))];cm=combo.search(w)
-  if not cm:continue
-  nums=[f'{int(cm.group(j)):02d}' for j in range(1,7)];sp=f'{int(cm.group(7)):02d}';tm=tr.search(w);ot=(f'{tm.group(1)}-{int(tm.group(2)):02d}-{int(tm.group(3)):02d} {tm.group(4)}:{tm.group(5)}:{tm.group(6) or "00"}' if tm else infer(issue));
-  if ot:out.append((issue,ot,nums,sp))
- seen=set();u=[]
- for x in out:
-  if x[0] not in seen:seen.add(x[0]);u.append(x)
- return u
-
-def save(ds):
- c=db();n=0
- for issue,ot,nums,sp in ds:
-  if len(nums)==6 and sp:
-   c.execute('INSERT OR REPLACE INTO draws VALUES(?,?,?,?)',(issue,ot,','.join(nums),sp));n+=1
- c.commit();c.close();return n
-
-def rows(limit=None):
- c=db();q='SELECT * FROM draws ORDER BY open_time DESC,issue DESC';rs=c.execute(q if limit is None else q+' LIMIT ?',() if limit is None else (limit,)).fetchall();c.close();return [{'issue':r['issue'],'time':r['open_time'],'main':r['nums'].split(','),'special':r['special']} for r in rs]
-
-def cand():
- rs=rows(None);sc=Counter()
- for i,r in enumerate(rs):
-  w=max(1,120-i)
-  for n in r['main']+[r['special']]:sc[n]+=w
- return sorted(sc.items(),key=lambda x:(-x[1],x[0]))[:22]
-
-def tg_loop():
- global TG
- if not TOKEN:TG['error']='TELEGRAM_BOT_TOKEN 未设置';return
- off=None
- while True:
-  try:
-   res=requests.post(TG_API+'/getUpdates',json={'offset':off,'timeout':20,'allowed_updates':['message']},timeout=25).json()
-   if not res.get('ok'):raise RuntimeError(str(res))
-   TG['ok']=True;TG['error']=''
-   for u in res.get('result',[]):
-    off=u['update_id']+1;msg=u.get('message') or {};ds=parse_tg(msg.get('text',''))
-    if ds:
-     save(ds);issue=max(ds,key=lambda x:x[0])[0];TG['issue']=issue;TG['time']=datetime.now(TZ8).strftime('%Y-%m-%d %H:%M:%S');print('TELEGRAM_DRAW',issue,flush=True)
-  except Exception as e:
-   TG['ok']=False;TG['error']=str(e)[:200];print('TELEGRAM_ERROR',TG['error'],flush=True);time.sleep(5)
-
-def public_sync():
- with ThreadPoolExecutor(max_workers=3) as ex:
-  fs=[ex.submit(lambda u: (lambda r:(parse_web(r.text),u))(requests.get(u,headers=HEAD,timeout=12)),u) for u in SOURCES]
-  for f in as_completed(fs):
-   try:
-    ds,u=f.result()
-    if ds:return save(ds),f'公开源 {u}'
-   except:pass
- return 0,'公开源暂未读取到新数据'
-
-init();state={'s':'正在首次同步…','e':False}
-def bg():
- while True:
-  try:n,s=public_sync();state.update(s=f'{s}，更新 {n} 条',e=False)
-  except Exception as e:state.update(s='公开源同步失败：'+str(e),e=True)
-  time.sleep(30)
-threading.Thread(target=bg,daemon=True).start();threading.Thread(target=tg_loop,daemon=True).start()
-
-@app.route('/')
-def home():
- rs=rows(100);last=rs[0] if rs else None;cs=cand();tgs='🟢 Telegram实时接收正常' if TG['ok'] else ('🔴 Telegram接收异常：'+TG['error'] if TG['error'] else '🟡 Telegram正在等待实时消息…')
- return render_template_string(HTML,li=last['issue'] if last else None,lt=last['time'] if last else '—',lm=last['main'] if last else [],ls=last['special'] if last else None,cs=cs,ct=' '.join(x[0] for x in cs),tgok=TG['ok'],tgs=tgs,tgi=TG['issue'],tgt=TG['time'],now=datetime.now(TZ8).strftime('%Y-%m-%d %H:%M:%S'),status=state['s'],err=state['e'],rs=rs)
-
-@app.route('/sync')
 def sync():
- try:n,s=public_sync();state.update(s=f'{s}，更新 {n} 条',e=False)
- except Exception as e:state.update(s='同步失败：'+str(e),e=True)
- return home()
-@app.route('/api/draws')
-def api():return jsonify(rows(100))
-if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','10000')))
+    r=requests.get(SOURCE_URL,headers=HEADERS,timeout=20); r.raise_for_status()
+    draws=parse_source(r.text)
+    if not draws: raise RuntimeError('页面已打开，但没有解析到完整的6正码+1特码，已停止写入，避免污染数据。')
+    c=db(); added=0
+    for issue,ot,nums,special in draws:
+        # only genuine 3-minute issue format
+        if not re.fullmatch(r'20\d{10}',issue): continue
+        c.execute('INSERT OR REPLACE INTO draws(issue,open_time,nums,special) VALUES(?,?,?,?)',(issue,ot,','.join(nums),special)); added+=1
+    c.commit(); c.close(); return len(draws),added
+
+def rows(limit=80):
+    c=db(); rs=c.execute('SELECT * FROM draws ORDER BY open_time DESC LIMIT ?', (limit,)).fetchall(); c.close()
+    return [{'issue':r['issue'],'time':r['open_time'],'main':r['nums'].split(','),'special':r['special']} for r in rs]
+
+def candidates():
+    rs=rows(80); score=Counter()
+    for idx,r in enumerate(rs):
+        weight=max(1,80-idx)
+        for n in r['main']+[r['special']]: score[n]+=weight
+    return sorted(score.items(), key=lambda x:(-x[1],x[0]))[:10]
+
+init_db(); state={'status':'尚未同步','error':False}
+
+def bg():
+    while True:
+        try:
+            sync(); state.update(status='自动同步正常',error=False)
+        except Exception as e: state.update(status='同步失败：'+str(e),error=True)
+        time.sleep(60)
+threading.Thread(target=bg,daemon=True).start()
+
+@APP.route('/')
+def home():
+    rs=rows(30); latest=rs[0] if rs else None
+    now=datetime.now(TZ8).strftime('%Y-%m-%d %H:%M:%S')
+    return render_template_string(HTML,latest_issue=latest['issue'] if latest else None,latest_time=latest['time'] if latest else '—',latest_main=latest['main'] if latest else [],latest_special=latest['special'] if latest else None,candidates=candidates(),sample_n=min(80,len(rs)),rows=rs,now=now,status=state['status'],error=state['error'])
+
+@APP.route('/sync')
+def manual_sync():
+    try:
+        n,a=sync(); state.update(status=f'同步完成：读取 {n} 期，写入/更新 {a} 期',error=False)
+    except Exception as e: state.update(status='同步失败：'+str(e),error=True)
+    return home()
+
+@APP.route('/api/draws')
+def api_draws(): return jsonify(rows(100))
+
+if __name__=='__main__': APP.run(host='0.0.0.0',port=int(os.getenv('PORT','10000')))
