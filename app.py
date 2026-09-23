@@ -1,236 +1,425 @@
-import os, re, json, sqlite3, threading, time
-from datetime import datetime, timedelta
-from collections import Counter
-from flask import Flask, jsonify, render_template_string
-import requests
-from bs4 import BeautifulSoup
+import os,re,sqlite3,threading,time,json,urllib.request
+from datetime import datetime,timezone,timedelta
+from flask import Flask,jsonify,render_template_string
+app=Flask(__name__)
+DB_PATH=os.getenv('DB_PATH','draws.db'); BOT_TOKEN=os.getenv('TELEGRAM_BOT_TOKEN','').strip(); BJ=timezone(timedelta(hours=8))
+Z={1:'马',13:'马',25:'马',37:'马',49:'马',2:'蛇',14:'蛇',26:'蛇',38:'蛇',3:'龙',15:'龙',27:'龙',39:'龙',4:'兔',16:'兔',28:'兔',40:'兔',5:'虎',17:'虎',29:'虎',41:'虎',6:'牛',18:'牛',30:'牛',42:'牛',7:'鼠',19:'鼠',31:'鼠',43:'鼠',8:'猪',20:'猪',32:'猪',44:'猪',9:'狗',21:'狗',33:'狗',45:'狗',10:'鸡',22:'鸡',34:'鸡',46:'鸡',11:'猴',23:'猴',35:'猴',47:'猴',12:'羊',24:'羊',36:'羊',48:'羊'}
+RED={1,2,7,8,12,13,18,19,23,24,29,30,34,35,40,45,46}; BLUE={3,4,9,10,14,15,20,25,26,31,36,37,41,42,47,48}; GREEN={5,6,11,16,17,21,22,27,28,32,33,38,39,43,44,49}
+def wave(n): return '红波' if n in RED else '蓝波' if n in BLUE else '绿波'
+def key(s):
+ m=re.search(r'\d{9,}',s or ''); return int(m.group()) if m else 0
+def init():
+ c=sqlite3.connect(DB_PATH); c.execute('CREATE TABLE IF NOT EXISTS draws(issue TEXT PRIMARY KEY,numbers TEXT,special INTEGER,received_at TEXT)'); c.commit()
+ try:
+  c.execute("ALTER TABLE draws ADD COLUMN source TEXT DEFAULT 'legacy'")
+ except Exception: pass
+ # 一次性把旧版本记录标成 legacy，让本版 API/网页重新校正，不再被旧错误特码锁住。
+ c.execute("UPDATE draws SET source='legacy' WHERE source IS NULL OR source='web'")
+ c.commit(); c.close()
+def save(issue,nums,source='web',force=False):
+ if len(nums)!=7 or len(set(nums))<7 or not all(1<=n<=49 for n in nums): return
+ c=sqlite3.connect(DB_PATH)
+ # 旧版本没有 source 字段，先补上。来源优先级：api > telegram > web。
+ try: c.execute("ALTER TABLE draws ADD COLUMN source TEXT DEFAULT 'legacy'")
+ except Exception: pass
+ pri={'legacy':0,'web':1,'telegram':2,'api':3}
+ row=c.execute('SELECT source FROM draws WHERE issue=?',(issue,)).fetchone()
+ if row and not force and pri.get(source,1) < pri.get(row[0] or 'web',1):
+  c.close(); return
+ c.execute('INSERT OR REPLACE INTO draws(issue,numbers,special,received_at,source) VALUES(?,?,?,?,?)',(issue,','.join(map(str,nums[:6])),nums[6],datetime.now(BJ).isoformat(),source))
+ c.commit(); c.close()
+def draws():
+ c=sqlite3.connect(DB_PATH); rows=c.execute('SELECT issue,numbers,special,received_at FROM draws ORDER BY issue DESC').fetchall(); c.close(); return [{'issue':i,'numbers':[int(x) for x in ns.split(',')],'special':sp,'received_at':t} for i,ns,sp,t in rows]
+def parse(t):
+ m=re.search(r'(?:澳门六合彩3分彩\s*[:：]\s*)?(\d{9,})\s*期?开奖结果?\s*[:：]\s*([0-9０-９,，、\s]+)',t or '')
+ if not m:return
+ raw=m.group(2).translate(str.maketrans('０１２３４５６７８９','0123456789')); ns=[int(x) for x in re.findall(r'\d{1,2}',raw)]
+ return (m.group(1),ns[:7]) if len(ns)>=7 else None
+def tg():
+ if not BOT_TOKEN:return
+ off=0
+ while True:
+  try:
+   u=f'https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?timeout=25&offset={off}'
+   with urllib.request.urlopen(u,timeout=35) as r:d=json.loads(r.read())
+   for x in d.get('result',[]):
+    off=x['update_id']+1; msg=x.get('message') or x.get('channel_post') or {}; p=parse(msg.get('text',''))
+    if p: save(*p,source='telegram')
+  except Exception: time.sleep(5)
 
-app = Flask(__name__)
-DB = os.path.join(os.path.dirname(__file__), 'draws.db')
-UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1'
-HEADERS = {'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8'}
-THREE_MIN_PAGE = 'https://macaujc.com/macaujc3/'
-THREE_MIN_LIVE = 'https://macaujc.com/open_video3/'
-# The site's public API page documents these endpoints, but its examples are ordinary Macau Mark Six.
-# We only accept API records whose issue looks like the 3-minute format (YYYYMMDD + 3 digits).
-LATEST_API = 'https://macaumarksix.com/api/macaujc3.com'
-HISTORY_API = 'https://history.macaumarksix.com/history/macaujc3/expect/{}'
-READER = 'https://r.jina.ai/http://macaujc.com/macaujc3/'
-
-HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>澳门六合彩3分分析</title>
-<style>
-*{box-sizing:border-box}body{margin:0;background:#f5f7fb;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.wrap{max-width:760px;margin:auto;padding:16px}.hero{background:#111827;color:#fff;border-radius:22px;padding:20px}.hero h1{font-size:25px;margin:0 0 8px}.sub{opacity:.8;font-size:13px;line-height:1.7}.btn{margin-top:15px;border:0;border-radius:14px;padding:13px 18px;background:#fff;color:#111827;font-size:16px;font-weight:800}.status{margin-top:12px;font-size:13px;line-height:1.55}.card{background:#fff;border-radius:20px;padding:17px;margin-top:13px;box-shadow:0 3px 16px #0000000a}.title{font-size:20px;font-weight:850;margin-bottom:10px}.muted{color:#6b7280;font-size:13px;line-height:1.6}.latest{font-weight:800}.nums{display:flex;gap:7px;flex-wrap:wrap;margin-top:11px}.ball{width:39px;height:39px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#eef2ff;font-weight:850}.special{background:#fff3e8}.special-label{font-size:12px;color:#b45309;margin-top:6px}.tags{margin-top:8px}.tag{display:inline-block;background:#f0fdf4;border-radius:10px;padding:6px 9px;margin:3px;font-weight:750}.tag small{font-weight:500;color:#6b7280}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;min-width:560px}td,th{padding:9px 5px;border-bottom:1px solid #edf0f5;text-align:left;vertical-align:top}th{color:#6b7280}.err{color:#b91c1c}.ok{color:#047857}
-</style></head><body><div class="wrap">
-<div class="hero"><h1>🎯 澳门六合彩3分分析</h1><div class="sub">自动同步 · 历史统计 · 数据回测<br>只处理“澳门六合彩3分”，正码与特码分开保存，不混入普通澳门六合彩。</div>
-<button class="btn" onclick="syncNow()">立即同步</button><div id="status" class="status">正在读取…</div></div>
-<div class="card"><div class="title">最新开奖</div><div id="latest" class="muted">加载中…</div></div>
-<div class="card"><div class="title">统计候选</div><div class="muted">按最近历史的出现次数排序，仅作统计参考，不代表下一期概率或中奖结果。</div><div id="scores" class="tags">加载中…</div></div>
-<div class="card"><div class="title">最近50期</div><div class="table-wrap"><table><thead><tr><th>期号</th><th>开奖时间</th><th>正码1-6</th><th>特码</th></tr></thead><tbody id="history"></tbody></table></div></div>
-</div>
-<script>
-let busy=false;
-function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
-async function load(){try{const r=await fetch('/api/data',{cache:'no-store'});const d=await r.json();const x=d.draws||[];
-const latest=document.getElementById('latest');
-if(x.length){const a=x[0];latest.innerHTML=`<div>第${esc(a.issue)}期 · ${esc(a.time)}</div><div class="nums">${a.numbers.map((n,i)=>`<span class="ball ${i===6?'special':''}">${String(n).padStart(2,'0')}</span>`).join('')}</div><div class="special-label">特码：${String(a.special).padStart(2,'0')}</div>`;}else latest.textContent='暂未抓到数据';
-document.getElementById('scores').innerHTML=(d.scores||[]).map(a=>`<span class="tag">${String(a[0]).padStart(2,'0')} · ${a[1]}次</span>`).join('')||'暂无统计';
-document.getElementById('history').innerHTML=x.map(a=>`<tr><td>${esc(a.issue)}</td><td>${esc(a.time)}</td><td>${a.numbers.slice(0,6).map(n=>String(n).padStart(2,'0')).join(' ')}</td><td><b>${String(a.special).padStart(2,'0')}</b></td></tr>`).join('');
-}catch(e){document.getElementById('status').textContent='读取失败：'+e}}
-async function syncNow(){if(busy)return;busy=true;const s=document.getElementById('status');s.textContent='正在同步澳门六合彩3分…';try{const r=await fetch('/api/sync?ts='+Date.now(),{cache:'no-store'});const d=await r.json();if(d.ok){s.className='status ok';s.textContent=`同步完成：本次新增/更新 ${d.parsed} 条，数据库共 ${d.total} 条。最新：${d.latest||'未知'}`;}else{s.className='status err';s.textContent='同步失败：'+(d.error||'未知错误');}await load()}catch(e){s.className='status err';s.textContent='同步失败：'+e}finally{busy=false}}
-load();
-// 页面打开时主动同步；这比依赖 Render 免费实例的后台线程可靠。
-syncNow();
-setInterval(syncNow,30000);
-setInterval(load,10000);
-</script></body></html>'''
-
-
-def init_db():
-    with sqlite3.connect(DB) as c:
-        c.execute('''CREATE TABLE IF NOT EXISTS draws(issue TEXT PRIMARY KEY, draw_time TEXT NOT NULL, numbers TEXT NOT NULL, special INTEGER, updated_at TEXT NOT NULL)''')
-        # Upgrade databases created by older versions.
-        cols = {r[1] for r in c.execute('PRAGMA table_info(draws)')}
-        if 'special' not in cols:
-            c.execute('ALTER TABLE draws ADD COLUMN special INTEGER')
-        c.commit()
-
-
-def issue_ok(x):
-    s = re.sub(r'\D', '', str(x))
-    return s if len(s) >= 10 else None
-
-
-def nums7(value):
-    if isinstance(value, list): raw = value
-    else: raw = re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d)(?!\d)', str(value))
+def parse_embedded_history(raw):
+    """从页面原始HTML/内联JS中的 JSON/对象数据提取3分彩历史。"""
+    if not raw:
+        return []
     out=[]
-    for v in raw:
-        try:
-            n=int(v)
-            if 1<=n<=49: out.append(n)
-        except Exception: pass
-    return out[:7] if len(out)>=7 else None
+    # 常见JSON键名：expect/issue + openCode/open_code/opencode
+    patterns = [
+        r'["\']expect["\']\s*:\s*["\'](20\d{9})["\'][\s\S]{0,500}?["\']openCode["\']\s*:\s*["\']([^"\']+)["\']',
+        r'["\']issue["\']\s*:\s*["\'](20\d{9})["\'][\s\S]{0,500}?["\'](?:openCode|open_code|opencode)["\']\s*:\s*["\']([^"\']+)["\']',
+        r'expect\s*:\s*["\'](20\d{9})["\'][\s\S]{0,500}?(?:openCode|open_code|opencode)\s*:\s*["\']([^"\']+)["\']',
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, raw, re.I):
+            issue=m.group(1); code=m.group(2)
+            nums=[]
+            for q in re.findall(r'\d{1,2}',code):
+                n=int(q)
+                if 1<=n<=49 and n not in nums: nums.append(n)
+            if len(nums)>=7 and len(set(nums[:7]))==7:
+                out.append((issue,nums[:7]))
+    # 有些页面把期号和7个号码作为连续文本写进JS
+    for m in re.finditer(r'(20\d{9})[\s\S]{0,220}?(?<!\d)(0?[1-9]|[1-4]\d|49)(?:\D+)(0?[1-9]|[1-4]\d|49)(?:\D+)(0?[1-9]|[1-4]\d|49)(?:\D+)(0?[1-9]|[1-4]\d|49)(?:\D+)(0?[1-9]|[1-4]\d|49)(?:\D+)(0?[1-9]|[1-4]\d|49)(?:\D+)(0?[1-9]|[1-4]\d|49)', raw):
+        issue=m.group(1); ns=[int(x) for x in m.groups()[1:]]
+        if len(set(ns))==7: out.append((issue,ns))
+    seen=set(); clean=[]
+    for x in out:
+        if x[0] not in seen:
+            seen.add(x[0]); clean.append(x)
+    return clean
 
-
-def add(found, issue, dt, nums, special=None, priority=50):
-    issue=issue_ok(issue); nums=nums7(nums)
-    if not issue or not dt or not nums or len(nums)!=7: return
-    sp = int(special) if str(special).isdigit() and 1<=int(special)<=49 else nums[6]
-    nums = nums[:6] + [sp]
-    old=found.get(issue)
-    if old is None or priority >= old[4]:
-        found[issue]=(issue,str(dt).strip(),nums,sp,priority)
-
-
-def parse_json_obj(obj, found):
-    if isinstance(obj, list): items=obj
-    elif isinstance(obj, dict):
-        items=obj.get('data') if isinstance(obj.get('data'),list) else []
-        if not items and all(k in obj for k in ('expect','openCode')): items=[obj]
-    else: return
-    for it in items:
-        if not isinstance(it,dict): continue
-        issue=it.get('expect') or it.get('issue') or it.get('period')
-        dt=it.get('openTime') or it.get('open_time') or it.get('drawTime')
-        code=it.get('openCode') or it.get('open_code') or it.get('numbers')
-        if issue and dt and code:
-            add(found,issue,dt,code,priority=100)
-
-
-def parse_json_text(text, found):
-    try: parse_json_obj(json.loads(text),found); return
-    except Exception: pass
-    for m in re.finditer(r'\{[^{}]{0,3000}"(?:expect|issue)"\s*:\s*"?([0-9]{10,})"?.{0,2500}?"(?:openCode|open_code)"\s*:\s*"([^"]+)".{0,1500}?"(?:openTime|open_time)"\s*:\s*"([^"]+)"',text,re.S):
-        add(found,m.group(1),m.group(3),m.group(2),priority=100)
-
-
-def parse_html(raw, found):
-    parse_json_text(raw,found)
-    soup=BeautifulSoup(raw,'html.parser')
-    # Prefer table rows because a 3-minute history page may render special separately.
-    for tr in soup.find_all('tr'):
-        cells=[c.get_text(' ',strip=True) for c in tr.find_all(['td','th'])]
-        if len(cells)<3: continue
-        mi=next((re.search(r'(\d{10,})',c) for c in cells if re.search(r'\d{10,}',c)),None)
-        if not mi: continue
-        issue=mi.group(1)
-        dt=next((re.search(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?',c) for c in cells if re.search(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}',c)),None)
-        if not dt: continue
-        nums=nums7(' '.join(cells[2:]))
-        if nums: add(found,issue,dt.group(0),nums,priority=50)
-    text=' '.join(soup.stripped_strings).replace('\xa0',' ')
-    matches=list(re.finditer(r'第\s*(\d{10,})\s*期',text))
-    for i,m in enumerate(matches):
-        block=text[m.end():(matches[i+1].start() if i+1<len(matches) else min(len(text),m.end()+5000))]
-        dt=re.search(r'(20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?)',block)
-        if not dt: continue
-        tail=block[dt.end():]
-        # If the page exposes the label 特碼, use the first number immediately after that label.
-        sm=re.search(r'(?:特碼|特码)\s*[:：]?\s*(?:[^0-9]{0,40})((?:0?[1-9]|[1-4]\d))',tail)
-        special=int(sm.group(1)) if sm else None
-        ns=nums7(tail)
-        if ns: add(found,m.group(1),dt.group(1),ns,special,priority=50)
-
-
-def get(url):
-    r=requests.get(url,headers=HEADERS,timeout=20)
-    r.raise_for_status(); return r
-
-
-def collect():
-    found={}; errors=[]
-    # 1) Use the dedicated 3-minute API first; API records have highest priority.
-    try:
-        r=get(LATEST_API); parse_json_text(r.text,found)
-    except Exception as e: errors.append('latest-api: '+str(e))
-    # 2) Official 3-minute pages.
-    for u in (THREE_MIN_PAGE,THREE_MIN_LIVE):
-        try:
-            r=get(u); parse_html(r.text,found)
-        except Exception as e: errors.append(u+': '+str(e))
-    # 3) Text proxy fallback.
-    try:
-        r=get(READER); parse_html(r.text,found)
-    except Exception as e: errors.append('reader: '+str(e))
-    # 4) Fill nearby missing issues from the dedicated by-issue endpoint.
-    if found:
-        latest=max(found, key=lambda x: (found[x][1],x))
-        m=re.match(r'(\d{8})(\d{3})$',latest)
-        if m:
-            day,seq=m.group(1),int(m.group(2))
-            # Fetch a modest window; only records with 11-digit 3-minute issue format are accepted.
-            for k in range(max(1,seq-120),seq+1):
-                issue=day+f'{k:03d}'
-                if issue in found: continue
-                try:
-                    r=get(HISTORY_API.format(issue)); parse_json_text(r.text,found)
-                except Exception: pass
-    return found,errors
-
-
-def save(found):
-    now=datetime.utcnow().isoformat(timespec='seconds')
-    with sqlite3.connect(DB) as c:
-        for issue,dt,nums,sp,_priority in found.values():
-            c.execute('''INSERT INTO draws(issue,draw_time,numbers,special,updated_at) VALUES(?,?,?,?,?)
-                         ON CONFLICT(issue) DO UPDATE SET draw_time=excluded.draw_time,numbers=excluded.numbers,special=excluded.special,updated_at=excluded.updated_at''',
-                      (issue,dt,json.dumps(nums),sp,now))
-        c.commit()
-        return c.execute('SELECT COUNT(*) FROM draws').fetchone()[0]
-
-
-def all_rows(limit=200):
-    with sqlite3.connect(DB) as c:
-        rows=c.execute('SELECT issue,draw_time,numbers,special FROM draws ORDER BY draw_time DESC, issue DESC LIMIT ?', (limit,)).fetchall()
+def parse_web_history(html):
+    """解析3分彩历史：明确按“6个正码 + 特码”结构读取，避免把页面其它数字当特码。"""
     out=[]
-    for issue,dt,raw,sp in rows:
-        ns=json.loads(raw)
-        sp=sp if sp else ns[6]
-        out.append({'issue':issue,'time':dt,'numbers':ns,'special':sp})
+    rows=re.findall(r'<tr[^>]*>(.*?)</tr>', html or '', re.I|re.S)
+    if not rows:
+        rows=re.split(r'(?=20\d{9}\b)', html or '')
+    for row in rows:
+        txt=re.sub(r'<script[^>]*>.*?</script>|<style[^>]*>.*?</style>',' ',row,flags=re.I|re.S)
+        txt=re.sub(r'<[^>]+>',' ',txt)
+        txt=re.sub(r'&nbsp;|&#160;',' ',txt)
+        txt=re.sub(r'\s+',' ',txt).strip()
+        im=re.search(r'\b(20\d{9})\b',txt)
+        if not im: continue
+        issue=im.group(1)
+        tail=txt[im.end():]
+        # 日期、时间等都在期号后面，先删掉，避免时间数字进入号码。
+        tail=re.sub(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?',' ',tail)
+        # 3分彩历史文本通常明确用“+ / 澳 / 特码”分隔特码。
+        # 优先取分隔符前的6个唯一号码，再取分隔符后的第一个号码。
+        plus=re.search(r'\+\s*(?:澳|特(?:码)?|特码)?\s*',tail)
+        nums=[]
+        if plus:
+            left,right=tail[:plus.start()],tail[plus.end():]
+            leftvals=[int(v) for v in re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',left)]
+            for n in leftvals[-6:]:
+                if n not in nums: nums.append(n)
+            sp=None
+            for v in re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',right):
+                n=int(v)
+                if n not in nums:
+                    sp=n; break
+            if len(nums)==6 and sp is not None:
+                out.append((issue,nums+[sp]))
+                continue
+        # 备用：按单元格读取，但同样只接受明确的“6正码+特码”。
+        cells=re.findall(r'<(?:td|th)[^>]*>(.*?)</(?:td|th)>', row, re.I|re.S)
+        vals=[]
+        for cell in cells:
+            ct=re.sub(r'<[^>]+>',' ',cell); ct=re.sub(r'&nbsp;|&#160;',' ',ct); ct=re.sub(r'\s+',' ',ct).strip()
+            if re.search(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}',ct) or re.fullmatch(r'\d{1,2}:\d{2}(?::\d{2})?',ct): continue
+            vals += [int(v) for v in re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',ct)]
+        if len(vals)>=7:
+            # 去重并只接受7个号码，最后一个作为特码。
+            uniq=[]
+            for n in vals:
+                if n not in uniq: uniq.append(n)
+            if len(uniq)>=7 and len(set(uniq[:7]))==7: out.append((issue,uniq[:7]))
+    seen=set(); clean=[]
+    for x in out:
+        if x[0] not in seen:
+            seen.add(x[0]); clean.append(x)
+    return clean
+
+def fetch_history_page(page):
+    """3分彩历史页多种分页参数兜底。"""
+    urls=[
+        f'https://macaujc.com/macaujc3/?id=3&page={page}',
+        f'https://macaujc.com/macaujc3/?page={page}',
+        f'https://macaujc.com/macaujc3/?id=3&p={page}',
+        f'https://macaujc.com/macaujc3/?id=3&pageNum={page}',
+        f'https://macaujc.com/macaujc3/?id=3&currentPage={page}',
+        f'https://r.jina.ai/http://macaujc.com/macaujc3/?id=3&page={page}',
+        f'https://r.jina.ai/https://macaujc.com/macaujc3/?id=3&page={page}',
+    ]
+    for url in urls:
+        try:
+            req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Safari/605.1','Accept':'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8','Accept-Language':'zh-CN,zh;q=0.9'})
+            with urllib.request.urlopen(req,timeout=18) as r: html=r.read().decode('utf-8','ignore')
+            got=parse_embedded_history(html) or parse_web_history(html) or parse_text_history(html)
+            if got: return got
+        except Exception: continue
+    return []
+
+def parse_text_history(text):
+    """解析纯文本历史，严格按“6正码 + 特码”取值。"""
+    if not text: return []
+    out=[]
+    pat=re.compile(r'(20\d{9})\s*期?([\s\S]{0,320}?)(?=20\d{9}\s*期|$)')
+    for m in pat.finditer(text):
+        issue=m.group(1); block=m.group(2)
+        block=re.sub(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?',' ',block)
+        plus=re.search(r'\+\s*(?:澳|特(?:码)?|特码)?\s*',block)
+        if not plus: continue
+        left,right=block[:plus.start()],block[plus.end():]
+        nums=[]
+        leftvals=[int(x) for x in re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',left)]
+        for n in leftvals[-6:]:
+            if n not in nums: nums.append(n)
+        sp=None
+        for x in re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',right):
+            n=int(x)
+            if n not in nums: sp=n; break
+        if len(nums)==6 and sp is not None: out.append((issue,nums+[sp]))
+    seen=set(); clean=[]
+    for x in out:
+        if x[0] not in seen: seen.add(x[0]); clean.append(x)
+    return clean
+
+
+def parse_api_history(data):
+    out=[]
+    items=[]
+    if isinstance(data,dict):
+        items=data.get('data') or []
+    elif isinstance(data,list):
+        items=data
+    for x in items:
+        if not isinstance(x,dict):
+            continue
+        issue=str(x.get('expect') or x.get('issue') or '').strip()
+        code=str(x.get('openCode') or x.get('open_code') or x.get('opencode') or '').strip()
+        # 3分彩期号必须是 YYYYMMDD + 三位日内期号，例如 20260923001。
+        if not re.fullmatch(r'20\d{9}',issue):
+            continue
+        if not issue[4:8].isdigit() or not (1 <= int(issue[4:6]) <= 12 and 1 <= int(issue[6:8]) <= 31):
+            continue
+        ns=[]
+        for q in re.findall(r'\d{1,2}',code):
+            n=int(q)
+            if 1<=n<=49: ns.append(n)
+        if len(ns)>=7 and len(set(ns[:7]))==7:
+            out.append((issue,ns[:7]))
     return out
 
 
-def score_data():
-    rs=all_rows(100)
-    c=Counter()
-    for r in rs: c.update(r['numbers'][:6])
-    return sorted(c.items(),key=lambda x:(-x[1],x[0]))[:12]
+def fetch_api_history(year):
+    """官方站公开的3分彩历史接口。3分彩期号格式必须为 YYYYMMDDNNN。"""
+    urls=[
+        f'https://history.macaumarksix.com/history/macaujc3/y/{year}',
+        f'https://history.macaumarksix.com/history/macaujc3/year/{year}',
+    ]
+    for url in urls:
+        try:
+            req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*'})
+            with urllib.request.urlopen(req,timeout=12) as r:
+                raw=r.read().decode('utf-8','ignore')
+            data=json.loads(raw)
+            got=parse_api_history(data)
+            if got:
+                return got
+        except Exception:
+            continue
+    return []
+
+def fetch_issue_api(issue):
+    """逐期查询3分彩；同时尝试官方历史路径、当前接口查询参数和公共代理。"""
+    urls=[
+        f'https://history.macaumarksix.com/history/macaujc3/expect/{issue}',
+        f'https://history.macaumarksix.com/history/macaujc3/{issue}',
+        f'https://macaumarksix.com/api/macaujc3.com?expect={issue}',
+        f'https://macaumarksix.com/api/macaujc3.com?number={issue}',
+        f'https://macaumarksix.com/api/macaujc3.com?issue={issue}',
+    ]
+    for url in urls:
+        try:
+            req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*'})
+            with urllib.request.urlopen(req,timeout=7) as r:
+                raw=r.read().decode('utf-8','ignore')
+            try:
+                data=json.loads(raw); got=parse_api_history(data)
+            except Exception:
+                got=parse_embedded_history(raw) or parse_text_history(raw)
+            for item in got:
+                if item[0]==issue: return item
+        except Exception:
+            continue
+    return None
 
 
-def count_rows():
-    with sqlite3.connect(DB) as c: return c.execute('SELECT COUNT(*) FROM draws').fetchone()[0]
+def fetch_current_api():
+    """3分彩专用当前接口；只接受 YYYYMMDDNNN 期号。"""
+    for url in ['https://macaumarksix.com/api/macaujc3.com','https://macaumarksix.com/api/macaujc3']:
+        try:
+            req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*'})
+            with urllib.request.urlopen(req,timeout=8) as r:
+                data=json.loads(r.read().decode('utf-8','ignore'))
+            got=parse_api_history(data)
+            if got:
+                return got[0]
+        except Exception:
+            continue
+    return None
 
-
-def do_sync():
-    found,errors=collect()
-    total=save(found) if found else count_rows()
-    latest=max(found, key=lambda x:(found[x][1],x)) if found else (all_rows(1)[0]['issue'] if all_rows(1) else None)
-    return found,errors,total,latest
-
-@app.route('/')
-def index(): return render_template_string(HTML)
-
-@app.route('/api/data')
-def api_data(): return jsonify({'draws':all_rows(50),'scores':score_data(),'count':count_rows()})
-
-@app.route('/api/sync')
-def api_sync():
-    try:
-        found,errors,total,latest=do_sync()
-        if not found: return jsonify({'ok':False,'parsed':0,'total':total,'latest':latest,'error':'暂时没有解析到新的澳门六合彩3分数据。','details':errors}),502
-        return jsonify({'ok':True,'parsed':len(found),'total':total,'latest':latest,'details':errors})
-    except Exception as e:
-        return jsonify({'ok':False,'parsed':0,'total':count_rows(),'error':str(e)}),500
-
-def background():
+def web_backfill():
+    """严格按本周期001→当前期补齐；只有完整连续历史才用于预测。"""
     while True:
-        try: do_sync()
-        except Exception: pass
-        time.sleep(45)
+        try:
+            target=datetime.now(BJ).strftime('%Y%m%d')
+            # 先用当前接口确定真正的当前期，不再写死211。
+            curitem=fetch_current_api()
+            current_num=int(curitem[0][-3:]) if curitem and curitem[0].startswith(target) else 0
+            if curitem and curitem[0].startswith(target): save(curitem[0],curitem[1],source='api',force=True)
 
-init_db()
-threading.Thread(target=background,daemon=True).start()
+            # 年度历史接口/页面/内嵌JS先尽量一次性导入。
+            got=fetch_api_history(datetime.now(BJ).year)
+            for issue,ns in got:
+                if issue.startswith(target): save(issue,ns,source='api',force=True)
+            for page in range(1,61):
+                got=fetch_history_page(page)
+                for issue,ns in got:
+                    if issue.startswith(target):
+                        save(issue,ns)
+                        if issue[-3:].isdigit(): current_num=max(current_num,int(issue[-3:]))
 
-if __name__=='__main__': app.run(host='0.0.0.0',port=int(os.environ.get('PORT',5000)))
+            # 再检查数据库，确定应该补到哪里。
+            ds=draws()
+            nums=sorted({int(d['issue'][-3:]) for d in ds if d['issue'].startswith(target) and d['issue'][-3:].isdigit()})
+            if nums: current_num=max(current_num,max(nums))
+            if current_num<=0: current_num=1
+            expected=set(range(1,current_num+1))
+            have=set(nums)
+            missing=sorted(expected-have)
+
+            # 只补缺号；避免每分钟重复请求全部历史。
+            if missing:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                with ThreadPoolExecutor(max_workers=20) as ex:
+                    futs={ex.submit(fetch_issue_api,f'{target}{i:03d}'):i for i in missing}
+                    for f in as_completed(futs):
+                        try:
+                            item=f.result()
+                            if item and item[0].startswith(target): save(item[0],item[1],source='api',force=True)
+                        except Exception:
+                            pass
+
+            # 最后再扫一次页面，补充任何接口漏掉的期。
+            for page in range(1,61):
+                got=fetch_history_page(page)
+                for issue,ns in got:
+                    if issue.startswith(target): save(issue,ns)
+
+            # 连续性状态由页面读取；如果001~当前全齐，就进入60秒检查，否则15秒重试。
+            ds=draws()
+            have2={int(d['issue'][-3:]) for d in ds if d['issue'].startswith(target) and d['issue'][-3:].isdigit()}
+            complete=current_num>0 and all(i in have2 for i in range(1,current_num+1))
+            time.sleep(60 if complete else 15)
+        except Exception:
+            time.sleep(15)
+
+
+def cycle_start_for(ds):
+ # 本统计周期从当天001期开始；跨日后自动切换到新日期001期。
+ if ds:
+  latest=sorted(ds,key=lambda d:key(d['issue']),reverse=True)[0]['issue']
+  m=re.match(r'(\d{8})\d{3,}',latest)
+  if m:return m.group(1)+'001'
+ return datetime.now(BJ).strftime('%Y%m%d')+'001'
+
+def active(ds):
+ start=cycle_start_for(ds); k=key(start); return [d for d in ds if key(d['issue'])>=k],start
+
+def special_score_map(hist):
+    """只用历史特码给下一期特码打分；覆盖01~49全部号码。"""
+    score={n:0.0 for n in range(1,50)}
+    if not hist:
+        return score
+    hist=sorted(hist,key=lambda d:key(d['issue']))
+    L=len(hist)
+    # 多窗口近期权重 + 全周期频率
+    for w,wt in [(12,2.0),(24,1.45),(48,0.9),(96,0.5),(180,0.25)]:
+        part=hist[-w:]
+        if not part: continue
+        plen=len(part)
+        for i,d in enumerate(part):
+            recency=0.45+0.55*((i+1)/plen)
+            score[d['special']]+=wt*recency
+    # 长周期频率，避免只盯短期热号
+    for d in hist:
+        score[d['special']]+=0.035
+    # 遗漏值：近期没出的号码获得适度回补，但不压过强热号
+    last_seen={n:None for n in range(1,50)}
+    for i,d in enumerate(hist):
+        last_seen[d['special']]=i
+    for n in range(1,50):
+        if last_seen[n] is None:
+            gap=L
+        else:
+            gap=L-1-last_seen[n]
+        score[n]+=min(gap,40)*0.012
+    # 最近一期特码适度降权，连续重复进一步降权，形成变码。
+    last=hist[-1]['special']
+    score[last]*=0.72
+    if len(hist)>=2 and hist[-2]['special']==last:
+        score[last]*=0.55
+    # 最近3期同波色/生肖过热时轻微分散，避免候选长期扎堆。
+    recent=hist[-6:]
+    for n in range(1,50):
+        z=Z[n]; w=wave(n)
+        zc=sum(1 for d in recent if Z[d['special']]==z)
+        wc=sum(1 for d in recent if wave(d['special'])==w)
+        score[n]-=zc*0.025+wc*0.012
+    return score
+
+def score_candidates(hist, limit=22):
+    score=special_score_map(hist)
+    # 对01~49全部评分后取最高，不是固定01~22。
+    ranked=sorted(range(1,50),key=lambda n:(-score[n],n))
+    return ranked[:limit]
+
+def ensure_prediction_table():
+ c=sqlite3.connect(DB_PATH); c.execute('CREATE TABLE IF NOT EXISTS predictions(issue TEXT PRIMARY KEY,candidates TEXT,created_at TEXT,hit_count INTEGER,hit INTEGER)'); c.commit(); c.close()
+
+def evaluate_cycle(ds,start):
+    act=sorted([d for d in ds if key(d['issue'])>=key(start)],key=lambda d:key(d['issue']))
+    ensure_prediction_table(); c=sqlite3.connect(DB_PATH)
+    for idx,d in enumerate(act):
+        if idx==0: continue
+        cand=score_candidates(act[:idx],22)
+        hit=1 if d['special'] in cand else 0
+        c.execute('INSERT OR REPLACE INTO predictions(issue,candidates,created_at,hit_count,hit) VALUES(?,?,?,?,?)',(d['issue'],','.join(map(str,cand)),datetime.now(BJ).isoformat(),hit,hit))
+    c.commit(); rows=c.execute('SELECT COUNT(*),COALESCE(SUM(hit),0),COALESCE(SUM(hit_count),0) FROM predictions WHERE issue>=?',(start,)).fetchone(); c.close()
+    return {'cycle_draw_count':len(act),'evaluated_count':int(rows[0]),'hit_periods':int(rows[1]),'miss_periods':int(rows[0]-rows[1]),'hit_rate':round(rows[1]/rows[0]*100,1) if rows[0] else 0.0,'total_hits':int(rows[2])}
+
+def pack(n):return {'number':f'{n:02d}','zodiac':Z[n],'wave':wave(n)}
+@app.get('/')
+def home(): return render_template_string(HTML)
+@app.get('/api/data')
+def data():
+    ds=draws(); act,start=active(ds); latest=ds[0] if ds else None
+    hist=sorted(act,key=lambda d:key(d['issue']))
+    cand=score_candidates(hist,22) if hist else []
+    scores=special_score_map(hist)
+    # 生肖单独评分，但最终号码必须来自22码；每肖最多2个。
+    zrank=[]
+    recent=hist[-24:]
+    for z in set(Z.values()):
+        members=[n for n in cand if Z[n]==z]
+        if not members: continue
+        zhist=sum(1 for d in recent if Z[d['special']]==z)
+        # 生肖层面稍看近期冷/热，再在该肖内部取分最高2码。
+        zn=sorted(members,key=lambda n:(-(scores[n]+min(zhist,8)*0.03),n))[:2]
+        zscore=sum(scores[n] for n in zn)+(0.03*min(zhist,8))
+        zrank.append((z,zscore,zn))
+    zrank.sort(key=lambda x:(-x[1],x[0])); top=zrank[:5]
+    stats=evaluate_cycle(act,start)
+    history=[{'issue':d['issue'],'numbers':[pack(n) for n in d['numbers']],'special':pack(d['special']),'time':d['received_at']} for d in sorted(act,key=lambda d:key(d['issue']),reverse=True)]
+    return jsonify({'latest':({'issue':latest['issue'],'time':latest['received_at'],'numbers':[pack(n) for n in latest['numbers']],'special':pack(latest['special'])} if latest else None),'candidates':[pack(n) for n in sorted(cand)],'copy':','.join(f'{n:02d}' for n in sorted(cand)),'candidate_zodiacs':[{'zodiac':z,'numbers':[f'{n:02d}' for n in best]} for z,_,best in top],'active_count':len(act),'cycle_start':start,'stats':stats,'history':history,'data_status':{'total':len(ds),'today':len(act),'earliest':(sorted(ds,key=lambda d:key(d['issue']))[0]['issue'] if ds else None),'latest':(ds[0]['issue'] if ds else None)}})
+
+# Gunicorn 启动时必须主动启动 Telegram 与历史补抓线程。
+# 之前漏掉这一步会导致网页能打开，但开奖和历史都不会更新。
+init()
+ensure_prediction_table()
+threading.Thread(target=tg,daemon=True).start()
+threading.Thread(target=web_backfill,daemon=True).start()
+
+HTML='''<!doctype html><html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><title>澳门六合彩·3分</title><style>body{margin:0;background:#f4f7fb;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;color:#15233d}.head{background:#123f82;color:#fff;padding:14px}.wrap{max-width:900px;margin:auto;padding:10px}.card{background:#fff;border-radius:16px;padding:14px;margin-bottom:10px;box-shadow:0 4px 18px #17345a12}.row{display:flex;justify-content:space-between;align-items:center;gap:8px}.title{font-size:18px;font-weight:800}.muted{color:#78879c;font-size:12px}.status{background:#eaffef;color:#087d31;border-radius:18px;padding:6px 9px;font-size:12px}.latest{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}.ball{width:40px;height:40px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:900;border:2px solid}.red{color:#d71919;border-color:#ef4141;background:#fff1f1}.blue{color:#125de2;border-color:#2174ee;background:#eef5ff}.green{color:#129344;border-color:#20a453;background:#effbf3}.meta{text-align:center;font-size:10px;font-weight:700;margin-top:2px}.copy{background:#1667e8;color:#fff;border:0;border-radius:10px;padding:8px 11px;font-size:13px;font-weight:800}.nums{color:#084fe0;font-size:18px;font-weight:900;line-height:1.45;margin:8px 0;word-break:break-all}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:7px}.tile{text-align:center;border:1px solid #dfe6f0;border-radius:11px;padding:7px 2px}.n{font-size:18px;font-weight:900}.zgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:7px}.z{text-align:center;border:1px solid #ddd;border-radius:11px;padding:8px 3px}.zname{font-size:16px;font-weight:900}.znums{font-size:12px;color:#64748b;margin-top:3px;font-weight:800}.note{background:#eff6ff;border-radius:10px;padding:8px;color:#637795;font-size:11px;margin-top:8px}.hist{display:flex;flex-direction:column;gap:6px}.hrow{display:grid;grid-template-columns:72px 1fr 45px;align-items:center;border-bottom:1px solid #edf1f6;padding:5px 0;font-size:12px}.hnums{font-weight:800;letter-spacing:.3px}.hspec{font-weight:900;text-align:right}@media(max-width:650px){.grid{grid-template-columns:repeat(5,1fr)}.zgrid{grid-template-columns:repeat(3,1fr)}} </style><body><div class="head"><div class="row"><div><b>澳门六合彩 · 3分</b><div style="font-size:12px">实时开奖 · 下一期开奖结果预测</div></div><div class="status">🟢 实时接收</div></div></div><div class="wrap"><div class="card"><div class="row"><div class="title">最新开奖</div><div id="time" class="muted"></div></div><div id="issue" class="muted"></div><div id="latest" class="latest"></div></div><div class="card"><div class="row"><div><div class="title">⭐ 下一期预测特码</div><div class="muted">用最新一期之前的全部历史数据，01～49全部评分后取最高22码</div></div><button class="copy" onclick="cp()">复制22码</button></div><div id="nums" class="nums"></div><div id="grid" class="grid"></div><div id="stats" class="note"></div></div><div class="card"><div class="title">⭐ 下一期预测生肖</div><div class="muted">独立评分；每个生肖最多显示2个预测号码（号码来自22码）</div><div id="zgrid" class="zgrid" style="margin-top:8px"></div></div><div class="card"><div class="title">📜 本周期全部历史开奖</div><div class="muted" id="hcount"></div><div id="hist" class="hist" style="margin-top:6px"></div></div></div><script>let cpv='';function wc(w){return w[0]=='红'?'red':w[0]=='蓝'?'blue':'green'}function render(d){document.querySelector('#time').textContent=d.latest?new Date(d.latest.time).toLocaleString('zh-CN',{hour12:false}):'';document.querySelector('#issue').textContent=d.latest?'第'+d.latest.issue+'期':('等待历史数据抓取…（当前0期）');let h='';if(d.latest){for(const x of d.latest.numbers)h+=`<div><div class="ball ${wc(x.wave)}">${x.number}</div><div class="meta ${wc(x.wave)}">${x.zodiac}·${x.wave}</div></div>`;const x=d.latest.special;h+=`<div><div class="ball ${wc(x.wave)}">${x.number}</div><div class="meta ${wc(x.wave)}">${x.zodiac}·${x.wave}<br>特码</div></div>`}document.querySelector('#latest').innerHTML=h;cpv=d.copy;document.querySelector('#nums').textContent=d.copy;document.querySelector('#stats').innerHTML=`本周期：${d.cycle_start}　已开奖：${d.stats.cycle_draw_count}期　已回测：${d.stats.evaluated_count}期　命中：${d.stats.hit_periods}期　错误：${d.stats.miss_periods}期　历史命中率：${d.stats.hit_rate}%　累计命中：${d.stats.total_hits}次`;document.querySelector('#grid').innerHTML=d.candidates.map(x=>`<div class="tile"><div class="n ${wc(x.wave)}">${x.number}</div><div class="meta ${wc(x.wave)}">${x.zodiac}·${x.wave}</div></div>`).join('');document.querySelector('#zgrid').innerHTML=d.candidate_zodiacs.map(x=>`<div class="z"><div class="zname">${x.zodiac}</div><div class="znums">${x.numbers.join('、')}</div></div>`).join('');document.querySelector('#hcount').textContent='共'+d.history.length+'期（从'+d.cycle_start+'开始）';document.querySelector('#hist').innerHTML=d.history.map(r=>{let ns=r.numbers.map(x=>`<span class="smallball ${wc(x.wave)}">${x.number}</span>`).join(' ');return `<div class="hrow"><div>${r.issue.slice(-3)}期</div><div class="hnums">${ns}</div><div class="hspec ${wc(r.special.wave)}">+${r.special.number}</div></div>`}).join('')}async function load(){try{const r=await fetch('/api/data?x='+Date.now());if(!r.ok)throw new Error('API '+r.status);render(await r.json())}catch(e){document.querySelector('#issue').textContent='数据读取中…';}}async function cp(){try{await navigator.clipboard.writeText(cpv);alert('已复制：'+cpv)}catch(e){prompt('复制下面号码：',cpv)}}load();setInterval(load,15000)</script></body></html>'''
