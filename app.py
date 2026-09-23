@@ -9,13 +9,15 @@ def wave(n): return '红波' if n in RED else '蓝波' if n in BLUE else '绿波
 def key(s):
  m=re.search(r'\d{9,}',s or ''); return int(m.group()) if m else 0
 def init():
- c=sqlite3.connect(DB_PATH); c.execute('CREATE TABLE IF NOT EXISTS draws(issue TEXT PRIMARY KEY,numbers TEXT,special INTEGER,received_at TEXT)'); c.commit()
- try:
-  c.execute("ALTER TABLE draws ADD COLUMN source TEXT DEFAULT 'legacy'")
- except Exception: pass
- # 一次性把旧版本记录标成 legacy，让本版 API/网页重新校正，不再被旧错误特码锁住。
- c.execute("UPDATE draws SET source='legacy' WHERE source IS NULL OR source='web'")
- c.commit(); c.close()
+  c=sqlite3.connect(DB_PATH); c.execute('CREATE TABLE IF NOT EXISTS draws(issue TEXT PRIMARY KEY,numbers TEXT,special INTEGER,received_at TEXT)'); c.commit()
+  try:
+   c.execute("ALTER TABLE draws ADD COLUMN source TEXT DEFAULT 'legacy'")
+  except Exception: pass
+  # 清掉当前日期旧版本记录，避免错误特码继续留在数据库；随后按真源重新抓取。
+  today=datetime.now(BJ).strftime('%Y%m%d')
+  c.execute("DELETE FROM draws WHERE issue LIKE ?",(today+'%',))
+  c.execute("UPDATE draws SET source='legacy' WHERE source IS NULL OR source='web'")
+  c.commit(); c.close()
 def save(issue,nums,source='web',force=False):
  if len(nums)!=7 or len(set(nums))<7 or not all(1<=n<=49 for n in nums): return
  c=sqlite3.connect(DB_PATH)
@@ -270,16 +272,16 @@ def web_backfill():
             current_num=int(curitem[0][-3:]) if curitem and curitem[0].startswith(target) else 0
             if curitem and curitem[0].startswith(target): save(curitem[0],curitem[1],source='api',force=True)
 
-            # 年度历史接口/页面/内嵌JS先尽量一次性导入。
+            # 历史接口只作为辅助源；任何超过当前接口确认期号的记录一律拒绝。
             got=fetch_api_history(datetime.now(BJ).year)
             for issue,ns in got:
-                if issue.startswith(target): save(issue,ns,source='api',force=True)
+                if issue.startswith(target) and issue[-3:].isdigit() and int(issue[-3:]) <= current_num:
+                    save(issue,ns,source='api',force=True)
             for page in range(1,61):
                 got=fetch_history_page(page)
                 for issue,ns in got:
-                    if issue.startswith(target):
-                        save(issue,ns)
-                        if issue[-3:].isdigit(): current_num=max(current_num,int(issue[-3:]))
+                    if issue.startswith(target) and issue[-3:].isdigit() and int(issue[-3:]) <= current_num:
+                        save(issue,ns,source='web',force=True)
 
             # 再检查数据库，确定应该补到哪里。
             ds=draws()
@@ -292,21 +294,22 @@ def web_backfill():
 
             # 只补缺号；避免每分钟重复请求全部历史。
             if missing:
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-                with ThreadPoolExecutor(max_workers=20) as ex:
-                    futs={ex.submit(fetch_issue_api,f'{target}{i:03d}'):i for i in missing}
-                    for f in as_completed(futs):
-                        try:
-                            item=f.result()
-                            if item and item[0].startswith(target): save(item[0],item[1],source='api',force=True)
-                        except Exception:
-                            pass
+               from concurrent.futures import ThreadPoolExecutor, as_completed
+               with ThreadPoolExecutor(max_workers=20) as ex:
+                   futs={ex.submit(fetch_issue_api,f'{target}{i:03d}'):i for i in missing}
+                   for f in as_completed(futs):
+                       try:
+                           item=f.result()
+                           if item and item[0].startswith(target): save(item[0],item[1],source='api',force=True)
+                       except Exception:
+                           pass
 
-            # 最后再扫一次页面，补充任何接口漏掉的期。
+            # 最后再扫一次页面；仍然严格限制在当前接口确认的期号以内。
             for page in range(1,61):
                 got=fetch_history_page(page)
                 for issue,ns in got:
-                    if issue.startswith(target): save(issue,ns)
+                    if issue.startswith(target) and issue[-3:].isdigit() and int(issue[-3:]) <= current_num:
+                         save(issue,ns,source='web',force=True)
 
             # 连续性状态由页面读取；如果001~当前全齐，就进入60秒检查，否则15秒重试。
             ds=draws()
