@@ -617,7 +617,6 @@ def data():
 # 先初始化数据库表，再导入历史种子，避免首次部署出现 no such table: draws
 init()
 seed_robot_history()
-ensure_prediction_table()
 threading.Thread(target=tg,daemon=True).start()
 # 不启动任何网页/API历史补抓；历史数据只来自 Telegram 机器人。
 
