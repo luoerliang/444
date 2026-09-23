@@ -8,6 +8,79 @@ RED={1,2,7,8,12,13,18,19,23,24,29,30,34,35,40,45,46}; BLUE={3,4,9,10,14,15,20,25
 def wave(n): return '红波' if n in RED else '蓝波' if n in BLUE else '绿波'
 def key(s):
  m=re.search(r'\d{9,}',s or ''); return int(m.group()) if m else 0
+ROBOT_HISTORY_SEED = [
+    ('20260923151', [8, 47, 17, 40, 48, 18, 45]),
+    ('20260923152', [21, 35, 15, 5, 40, 10, 44]),
+    ('20260923153', [48, 31, 10, 24, 15, 47, 38]),
+    ('20260923154', [2, 46, 12, 15, 25, 19, 9]),
+    ('20260923155', [12, 31, 36, 33, 25, 38, 15]),
+    ('20260923156', [8, 47, 25, 40, 10, 24, 46]),
+    ('20260923157', [6, 27, 5, 45, 12, 15, 23]),
+    ('20260923158', [34, 32, 8, 5, 24, 35, 19]),
+    ('20260923159', [43, 37, 49, 48, 2, 11, 30]),
+    ('20260923160', [18, 16, 22, 25, 1, 46, 5]),
+    ('20260923161', [47, 15, 20, 34, 26, 25, 30]),
+    ('20260923162', [10, 36, 28, 42, 41, 4, 12]),
+    ('20260923163', [1, 44, 20, 47, 41, 42, 31]),
+    ('20260923164', [46, 32, 44, 38, 43, 8, 2]),
+    ('20260923165', [2, 48, 42, 33, 4, 34, 28]),
+    ('20260923166', [23, 20, 26, 18, 27, 45, 24]),
+    ('20260923167', [1, 42, 24, 21, 13, 26, 30]),
+    ('20260923168', [39, 7, 27, 46, 8, 21, 14]),
+    ('20260923169', [39, 35, 37, 15, 38, 12, 21]),
+    ('20260923170', [22, 24, 3, 37, 39, 18, 35]),
+    ('20260923172', [40, 49, 17, 1, 42, 41, 13]),
+    ('20260923179', [25, 45, 23, 41, 13, 24, 8]),
+    ('20260923180', [3, 38, 12, 25, 16, 14, 28]),
+    ('20260923181', [28, 41, 5, 45, 9, 30, 39]),
+    ('20260923182', [7, 20, 43, 34, 33, 19, 24]),
+    ('20260923183', [13, 7, 9, 27, 4, 14, 32]),
+    ('20260923184', [9, 12, 2, 32, 5, 27, 48]),
+    ('20260923185', [48, 12, 40, 1, 49, 16, 37]),
+    ('20260923186', [46, 20, 17, 10, 5, 13, 49]),
+    ('20260923187', [9, 28, 34, 7, 15, 41, 46]),
+    ('20260923188', [15, 6, 45, 43, 12, 38, 27]),
+    ('20260923189', [13, 48, 37, 24, 44, 36, 8]),
+    ('20260923190', [47, 11, 22, 26, 28, 14, 16]),
+    ('20260923191', [47, 13, 17, 34, 21, 49, 12]),
+    ('20260923192', [10, 14, 27, 22, 23, 42, 44]),
+    ('20260923193', [32, 47, 31, 6, 10, 2, 11]),
+    ('20260923194', [28, 49, 12, 37, 31, 24, 20]),
+    ('20260923195', [26, 27, 37, 34, 17, 46, 48]),
+    ('20260923196', [20, 22, 41, 28, 5, 44, 33]),
+    ('20260923198', [8, 20, 9, 48, 43, 49, 16]),
+    ('20260923199', [17, 34, 24, 47, 5, 33, 28]),
+    ('20260923200', [5, 48, 17, 31, 42, 16, 37]),
+    ('20260923201', [5, 32, 9, 14, 34, 26, 10]),
+    ('20260923202', [10, 13, 6, 32, 21, 35, 1]),
+    ('20260923203', [28, 41, 47, 9, 17, 45, 6]),
+    ('20260923204', [8, 20, 23, 1, 33, 37, 17]),
+    ('20260923205', [27, 34, 21, 16, 45, 49, 13]),
+    ('20260923206', [39, 49, 42, 36, 45, 43, 6]),
+    ('20260923207', [3, 28, 9, 27, 29, 11, 7]),
+    ('20260923208', [13, 47, 40, 16, 10, 38, 37]),
+    ('20260923209', [49, 39, 2, 38, 25, 22, 35]),
+    ('20260923210', [7, 4, 42, 44, 8, 11, 18]),
+    ('20260923213', [20, 8, 46, 37, 43, 9, 7]),
+    ('20260923215', [47, 16, 28, 33, 49, 8, 18]),
+    ('20260923217', [2, 32, 20, 9, 13, 45, 44]),
+    ('20260923220', [47, 18, 12, 10, 26, 48, 19]),
+    ('20260923226', [35, 49, 40, 31, 17, 16, 27]),
+    ('20260923234', [39, 3, 17, 40, 16, 24, 49]),
+]
+
+def seed_robot_history():
+    """只补入当前已提供的机器人历史；绝不覆盖线上已有历史。"""
+    c=sqlite3.connect(DB_PATH)
+    try: c.execute("ALTER TABLE draws ADD COLUMN source TEXT DEFAULT 'legacy'")
+    except Exception: pass
+    for issue, nums in ROBOT_HISTORY_SEED:
+        row=c.execute('SELECT issue FROM draws WHERE issue=?',(issue,)).fetchone()
+        if row: continue
+        c.execute('INSERT INTO draws(issue,numbers,special,received_at,source) VALUES(?,?,?,?,?)',
+                  (issue,','.join(map(str,nums[:6])),nums[6],datetime.now(BJ).isoformat(),'telegram'))
+    c.commit(); c.close()
+
 def init():
   c=sqlite3.connect(DB_PATH); c.execute('CREATE TABLE IF NOT EXISTS draws(issue TEXT PRIMARY KEY,numbers TEXT,special INTEGER,received_at TEXT)'); c.commit()
   try:
@@ -344,135 +417,93 @@ def cycle_start_for(ds):
 def active(ds):
  start=cycle_start_for(ds); k=key(start); return [d for d in ds if key(d['issue'])>=k],start
 
-def _feature_scores(hist):
-    """为01~49生成只依赖历史特码的多维特征。不会读取当前预测期。"""
+def _feature_scores(hist, weights):
+    """为01~49生成无未来信息的特码评分。"""
+    score={n:0.0 for n in range(1,50)}
+    if not hist: return score
     hist=sorted(hist,key=lambda d:key(d['issue']))
     L=len(hist)
-    out={n:{} for n in range(1,50)}
-    if not L:
-        return out
-
-    # 各窗口出现频率：短期、中期、长期
+    # 长期频率：稳定底盘
+    freq={n:0 for n in range(1,50)}
+    for d in hist: freq[d['special']]+=1
+    for n in range(1,50): score[n] += weights['long']*(freq[n]/max(1,L))
+    # 多窗口近期频率：短期变化
+    for window,name in [(8,'w8'),(16,'w16'),(32,'w32'),(64,'w64')]:
+        part=hist[-window:]
+        if not part: continue
+        cnt={n:0 for n in range(1,50)}
+        for d in part: cnt[d['special']]+=1
+        for n in range(1,50): score[n] += weights[name]*(cnt[n]/len(part))
+    # 最近出现位置/趋势：越近期适度加分，但不是简单追热
+    lastpos={n:None for n in range(1,50)}
+    for i,d in enumerate(hist): lastpos[d['special']]=i
     for n in range(1,50):
-        vals=[]
-        for w in (8,16,32,64,120):
-            part=hist[-min(w,L):]
-            vals.append(sum(d['special']==n for d in part)/len(part))
-        out[n]['f8'],out[n]['f16'],out[n]['f32'],out[n]['f64'],out[n]['f120']=vals
-
-    # 遗漏：标准化后限制影响，避免“越久没出越应该出”的机械逻辑
+        gap=L if lastpos[n] is None else L-1-lastpos[n]
+        score[n] += weights['gap']*min(gap,30)/30.0
+    # 短期升温：最近8期相对前16期的频率变化
+    recent=hist[-8:]
+    prev=hist[-24:-8]
+    rc={n:0 for n in range(1,50)}; pc={n:0 for n in range(1,50)}
+    for d in recent: rc[d['special']]+=1
+    for d in prev: pc[d['special']]+=1
     for n in range(1,50):
-        gap=L
-        for i in range(L-1,-1,-1):
-            if hist[i]['special']==n:
-                gap=L-1-i
-                break
-        out[n]['gap']=min(gap,30)/30.0
-
-    # 最近趋势：近8 vs 前8、近16 vs 前16
+        r=rc[n]/max(1,len(recent)); q=pc[n]/max(1,len(prev))
+        score[n] += weights['trend']*(r-q)
+    # 最近一期重复抑制 + 两期连续重复更强抑制
+    if hist:
+        last=hist[-1]['special']; score[last] -= weights['repeat']
+        if len(hist)>=2 and hist[-2]['special']==last: score[last] -= weights['repeat']*0.65
+    # 轻微结构分散，防止22码过度集中到同一生肖/波色
+    recent6=hist[-6:]
     for n in range(1,50):
-        p8=hist[-8:]
-        q8=hist[-16:-8] if L>8 else []
-        p16=hist[-16:]
-        q16=hist[-32:-16] if L>16 else []
-        a=sum(d['special']==n for d in p8)/len(p8)
-        b=sum(d['special']==n for d in q8)/len(q8) if q8 else 0
-        c=sum(d['special']==n for d in p16)/len(p16)
-        d=sum(x['special']==n for x in q16)/len(q16) if q16 else 0
-        out[n]['trend8']=a-b
-        out[n]['trend16']=c-d
+        zc=sum(Z[d['special']]==Z[n] for d in recent6)
+        wc=sum(wave(d['special'])==wave(n) for d in recent6)
+        score[n] -= weights['crowd_z']*zc + weights['crowd_w']*wc
+    return score
 
-    # 最后一期重复/连出惩罚作为独立特征
-    last=hist[-1]['special']
-    prev=(hist[-2]['special'] if L>=2 else None)
-    for n in range(1,50):
-        out[n]['repeat'] = 1.0 if n==last else 0.0
-        out[n]['double_repeat'] = 1.0 if n==last==prev else 0.0
+def _rank22(hist, weights):
+    sc=_feature_scores(hist,weights)
+    return sorted(range(1,50),key=lambda n:(-sc[n],n))[:22]
 
-    # 近期生肖/波色拥挤度，只作很小的分散信号
-    recent=hist[-6:]
-    for n in range(1,50):
-        out[n]['zhot']=sum(Z[d['special']]==Z[n] for d in recent)/max(1,len(recent))
-        out[n]['whot']=sum(wave(d['special'])==wave(n) for d in recent)/max(1,len(recent))
-    return out
-
-# 经过滚动回测验证的一组默认参数；实际运行时会用历史数据自动选择附近参数。
-DEFAULT_PARAMS={
-    'f8':2.00,'f16':1.35,'f32':0.80,'f64':0.42,'f120':0.20,
-    'gap':0.22,'trend8':0.85,'trend16':0.45,
-    'repeat':-0.65,'double_repeat':-0.55,
-    'zhot':-0.06,'whot':-0.035
-}
-
-def _score_from_features(feat, p):
-    s={}
-    for n,f in feat.items():
-        s[n]=(p['f8']*f['f8']+p['f16']*f['f16']+p['f32']*f['f32']+
-              p['f64']*f['f64']+p['f120']*f['f120']+p['gap']*f['gap']+
-              p['trend8']*f['trend8']+p['trend16']*f['trend16']+
-              p['repeat']*f['repeat']+p['double_repeat']*f['double_repeat']+
-              p['zhot']*f['zhot']+p['whot']*f['whot'])
-    return s
-
-def _candidate_hit(hist, params, limit=22):
-    if len(hist)<20: return 0
-    feat=_feature_scores(hist)
-    s=_score_from_features(feat,params)
-    return 1 if hist[-1]['special'] in sorted(range(1,50),key=lambda n:(-s[n],n))[:limit] else 0
-
-def _choose_dynamic_params(hist):
-    """滚动选择参数：每次只用更早历史预测已发生的历史期，避免看未来。"""
-    if len(hist)<35:
-        return DEFAULT_PARAMS
-    # 小范围候选，防止为了追历史而过拟合。
-    variants=[]
-    for fs in (0.85,1.0,1.15):
-        for tr in (0.70,1.0,1.30):
-            for gp in (0.70,1.0,1.30):
-                p=DEFAULT_PARAMS.copy()
-                p['f8']*=fs; p['f16']*=fs; p['f32']*=fs
-                p['trend8']*=tr; p['trend16']*=tr; p['gap']*=gp
-                variants.append(p)
-    # 只回测最近最多80个已知预测点，并保留默认方案作为基线。
-    begin=max(24,len(hist)-80)
-    best=DEFAULT_PARAMS; best_hit=-1; best_secondary=-1
-    for p in variants:
-        hits=0
-        # 对每个目标期，只能看到目标期之前的数据
-        for j in range(begin,len(hist)):
-            past=hist[:j]
-            if len(past)<20: continue
-            if _candidate_hit(hist[:j+1],p,22):
-                # _candidate_hit 的最后一期是目标期，所以这里等价于 past -> hist[j]
-                hits+=1
-        # 简单、稳定的二级指标：较近目标期权重更高
-        if hits>best_hit:
-            best, best_hit, best_secondary=p,hits,0
+def _tune_weights(hist):
+    """只用历史内部做滚动回测，自动选择一组权重；目标仍是22码命中。"""
+    base={
+        'long':0.80,'w8':2.10,'w16':1.50,'w32':0.95,'w64':0.55,
+        'gap':0.38,'trend':1.25,'repeat':0.16,'crowd_z':0.018,'crowd_w':0.010
+    }
+    if len(hist)<30: return base
+    configs=[]
+    for short in (1.7,2.1,2.5):
+      for trend in (0.8,1.25,1.7):
+       for gap in (0.20,0.38,0.56):
+        w=dict(base); w['w8']=short; w['trend']=trend; w['gap']=gap
+        configs.append(w)
+    # 用最近最多32个“已知目标”做严格走步回测；每次预测只看此前数据。
+    eval_n=min(32,len(hist)-20); begin=len(hist)-eval_n
+    best=base; best_score=(-1,-1)
+    for w in configs:
+        hits=0; total=0
+        for i in range(max(20,begin),len(hist)):
+            cand=_rank22(hist[:i],w)
+            hits += 1 if hist[i]['special'] in cand else 0
+            total += 1
+        # 最近表现优先，加入轻微稳定性项
+        score=(hits, sum(1 for i in range(max(20,begin),len(hist)) if hist[i]['special'] in _rank22(hist[:i],w)))
+        if score>best_score: best_score=score; best=w
     return best
 
 def special_score_map(hist):
-    """只用历史特码给下一期打分；01~49全部评分，并动态选择参数。"""
-    if not hist:
-        return {n:0.0 for n in range(1,50)}
-    hist=sorted(hist,key=lambda d:key(d['issue']))
-    p=_choose_dynamic_params(hist)
-    return _score_from_features(_feature_scores(hist),p)
+    return _feature_scores(hist,_tune_weights(hist))
 
 def score_candidates(hist, limit=22):
-    score=special_score_map(hist)
-    # 对01~49全部评分后取最高，不是固定01~22。
-    ranked=sorted(range(1,50),key=lambda n:(-score[n],n))
-    return ranked[:limit]
+    return _rank22(hist,_tune_weights(hist))[:limit]
 
 def ensure_prediction_table():
  c=sqlite3.connect(DB_PATH); c.execute('CREATE TABLE IF NOT EXISTS predictions(issue TEXT PRIMARY KEY,candidates TEXT,created_at TEXT,hit_count INTEGER,hit INTEGER)'); c.commit(); c.close()
 
 def evaluate_cycle(ds,start):
     act=sorted([d for d in ds if key(d['issue'])>=key(start)],key=lambda d:key(d['issue']))
-    ensure_prediction_table()
-    c=sqlite3.connect(DB_PATH)
-    c.execute('DELETE FROM predictions WHERE issue>=?',(start,))
-    c.commit()
+    ensure_prediction_table(); c=sqlite3.connect(DB_PATH)
     for idx,d in enumerate(act):
         if idx==0: continue
         cand=score_candidates(act[:idx],22)
@@ -508,6 +539,7 @@ def data():
 
 # Gunicorn 启动时必须主动启动 Telegram 与历史补抓线程。
 # 之前漏掉这一步会导致网页能打开，但开奖和历史都不会更新。
+seed_robot_history()
 init()
 ensure_prediction_table()
 threading.Thread(target=tg,daemon=True).start()
