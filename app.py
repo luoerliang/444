@@ -63,14 +63,12 @@ def parse_embedded_history(raw):
     return clean
 
 def parse_web_history(html):
-    """稳健解析3分彩历史页：按表格行识别期号，并从该行末尾提取7个开奖号码。"""
+    """解析3分彩历史：明确按“6个正码 + 特码”结构读取，避免把页面其它数字当特码。"""
     out=[]
     rows=re.findall(r'<tr[^>]*>(.*?)</tr>', html or '', re.I|re.S)
     if not rows:
         rows=re.split(r'(?=20\d{9}\b)', html or '')
     for row in rows:
-        # 保留单元格边界，避免把日期/时间里的数字当开奖号码
-        cells=re.findall(r'<(?:td|th)[^>]*>(.*?)</(?:td|th)>', row, re.I|re.S)
         txt=re.sub(r'<script[^>]*>.*?</script>|<style[^>]*>.*?</style>',' ',row,flags=re.I|re.S)
         txt=re.sub(r'<[^>]+>',' ',txt)
         txt=re.sub(r'&nbsp;|&#160;',' ',txt)
@@ -78,29 +76,40 @@ def parse_web_history(html):
         im=re.search(r'\b(20\d{9})\b',txt)
         if not im: continue
         issue=im.group(1)
+        tail=txt[im.end():]
+        # 日期、时间等都在期号后面，先删掉，避免时间数字进入号码。
+        tail=re.sub(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?',' ',tail)
+        # 3分彩历史文本通常明确用“+ / 澳 / 特码”分隔特码。
+        # 优先取分隔符前的6个唯一号码，再取分隔符后的第一个号码。
+        plus=re.search(r'\+\s*(?:澳|特(?:码)?|特码)?\s*',tail)
         nums=[]
-        # 优先逐td读取：期号/时间/号码通常分别在独立单元格。
-        for cell in cells:
-            ct=re.sub(r'<[^>]+>',' ',cell)
-            ct=re.sub(r'&nbsp;|&#160;',' ',ct)
-            ct=re.sub(r'\s+',' ',ct).strip()
-            # 过滤日期和时间单元格
-            if re.search(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}',ct) or re.fullmatch(r'\d{1,2}:\d{2}(?::\d{2})?',ct):
+        if plus:
+            left,right=tail[:plus.start()],tail[plus.end():]
+            for v in re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',left):
+                n=int(v)
+                if n not in nums: nums.append(n)
+                if len(nums)==6: break
+            sp=None
+            for v in re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',right):
+                n=int(v)
+                if n not in nums:
+                    sp=n; break
+            if len(nums)==6 and sp is not None:
+                out.append((issue,nums+[sp]))
                 continue
-            vals=re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',ct)
-            for v in vals:
-                n=int(v)
-                if n not in nums: nums.append(n)
-        # 若td结构不规则，取整行中最后7个唯一号码；时间/期号在前面，不影响末尾号码。
-        if len(nums)<7:
-            vals=re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',txt)
-            nums=[]
-            for v in vals:
-                n=int(v)
-                if n not in nums: nums.append(n)
-            if len(nums)>=7: nums=nums[-7:]
-        if len(nums)==7 and len(set(nums))==7:
-            out.append((issue,nums))
+        # 备用：按单元格读取，但同样只接受明确的“6正码+特码”。
+        cells=re.findall(r'<(?:td|th)[^>]*>(.*?)</(?:td|th)>', row, re.I|re.S)
+        vals=[]
+        for cell in cells:
+            ct=re.sub(r'<[^>]+>',' ',cell); ct=re.sub(r'&nbsp;|&#160;',' ',ct); ct=re.sub(r'\s+',' ',ct).strip()
+            if re.search(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}',ct) or re.fullmatch(r'\d{1,2}:\d{2}(?::\d{2})?',ct): continue
+            vals += [int(v) for v in re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',ct)]
+        if len(vals)>=7:
+            # 去重并只接受7个号码，最后一个作为特码。
+            uniq=[]
+            for n in vals:
+                if n not in uniq: uniq.append(n)
+            if len(uniq)>=7 and len(set(uniq[:7]))==7: out.append((issue,uniq[:7]))
     seen=set(); clean=[]
     for x in out:
         if x[0] not in seen:
@@ -128,27 +137,29 @@ def fetch_history_page(page):
     return []
 
 def parse_text_history(text):
-    """解析被代理/JS转换成纯文本的历史记录。"""
-    if not text:
-        return []
+    """解析纯文本历史，严格按“6正码 + 特码”取值。"""
+    if not text: return []
     out=[]
-    # 每条记录通常以 20260923001 期 开头，后面跟时间和7个号码。
-    pat=re.compile(r'(20\d{9})\s*期?([\s\S]{0,260}?)(?=20\d{9}\s*期|$)')
+    pat=re.compile(r'(20\d{9})\s*期?([\s\S]{0,320}?)(?=20\d{9}\s*期|$)')
     for m in pat.finditer(text):
         issue=m.group(1); block=m.group(2)
-        # 先去掉日期/时间，避免把时间数字当成开奖号码。
         block=re.sub(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?',' ',block)
+        plus=re.search(r'\+\s*(?:澳|特(?:码)?|特码)?\s*',block)
+        if not plus: continue
+        left,right=block[:plus.start()],block[plus.end():]
         nums=[]
-        for x in re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',block):
+        for x in re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',left):
             n=int(x)
             if n not in nums: nums.append(n)
-            if len(nums)==7: break
-        if len(nums)==7 and len(set(nums))==7:
-            out.append((issue,nums))
+            if len(nums)==6: break
+        sp=None
+        for x in re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',right):
+            n=int(x)
+            if n not in nums: sp=n; break
+        if len(nums)==6 and sp is not None: out.append((issue,nums+[sp]))
     seen=set(); clean=[]
     for x in out:
-        if x[0] not in seen:
-            seen.add(x[0]); clean.append(x)
+        if x[0] not in seen: seen.add(x[0]); clean.append(x)
     return clean
 
 
