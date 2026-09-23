@@ -156,56 +156,113 @@ def parse_api_history(data):
 
 
 def fetch_api_history(year):
-    # 不再把 macaujc2 的普通六合彩年度接口误当成3分彩。
-    # 如果未来公开3分彩历史API返回 YYYYMMDDNNN 格式，可直接在这里加入。
+    """官方站公开的3分彩历史接口。3分彩期号格式必须为 YYYYMMDDNNN。"""
+    urls=[
+        f'https://history.macaumarksix.com/history/macaujc3/y/{year}',
+        f'https://history.macaumarksix.com/history/macaujc3/year/{year}',
+    ]
+    for url in urls:
+        try:
+            req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*'})
+            with urllib.request.urlopen(req,timeout=12) as r:
+                raw=r.read().decode('utf-8','ignore')
+            data=json.loads(raw)
+            got=parse_api_history(data)
+            if got:
+                return got
+        except Exception:
+            continue
     return []
 
+def fetch_issue_api(issue):
+    """按3分彩完整期号兜底查询；用于历史分页/API不可用时逐期补齐。"""
+    urls=[
+        f'https://history.macaumarksix.com/history/macaujc3/expect/{issue}',
+        f'https://macaumarksix.com/api/macaujc3/expect/{issue}',
+    ]
+    for url in urls:
+        try:
+            req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*'})
+            with urllib.request.urlopen(req,timeout=6) as r:
+                data=json.loads(r.read().decode('utf-8','ignore'))
+            got=parse_api_history(data)
+            if got:
+                return got[0]
+        except Exception:
+            continue
+    return None
+
+def fetch_current_api():
+    """3分彩专用当前接口；只接受 YYYYMMDDNNN 期号。"""
+    for url in ['https://macaumarksix.com/api/macaujc3.com','https://macaumarksix.com/api/macaujc3']:
+        try:
+            req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*'})
+            with urllib.request.urlopen(req,timeout=8) as r:
+                data=json.loads(r.read().decode('utf-8','ignore'))
+            got=parse_api_history(data)
+            if got:
+                return got[0]
+        except Exception:
+            continue
+    return None
 
 def web_backfill():
-    """持续补齐当天001期到最新期；主源3分彩历史页，备用直播历史页。"""
+    """历史主源=3分彩专用API；网页分页/逐期API/直播页均为备用。"""
     while True:
-        reached=False; got_total=0
+        reached=False
         try:
             target=datetime.now(BJ).strftime('%Y%m%d')
-            # 先尝试3分彩历史分页。不同页面版本可能使用不同分页参数，fetch_history_page会逐个尝试。
-            empty_streak=0
-            for page in range(1,101):
-                got=fetch_history_page(page)
-                if not got:
-                    empty_streak += 1
-                    if empty_streak >= 8:
-                        break
-                    continue
-                empty_streak=0
-                for issue,ns in got:
-                    if issue.startswith(target):
-                        save(issue,ns); got_total += 1
-                    if issue == target+'001': reached=True
-                if reached: break
+            # ① 一次性拉全年3分彩历史（真正关键的修复）
+            got=fetch_api_history(datetime.now(BJ).year)
+            for issue,ns in got:
+                if issue.startswith(target): save(issue,ns)
+                if issue==target+'001': reached=True
 
-            # /open_video3/ 的页面已经验证会直接返回3分彩历史记录，作为强备用。
-            for url in [
-                'https://macaujc.com/open_video3/',
-                'https://r.jina.ai/http://macaujc.com/open_video3/',
-                'https://r.jina.ai/https://macaujc.com/open_video3/'
-            ]:
-                try:
-                    req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8'})
-                    with urllib.request.urlopen(req,timeout=20) as r:
-                        html=r.read().decode('utf-8','ignore')
-                    got=parse_web_history(html) or parse_text_history(html)
+            # ② 如果全年接口在当前网络不可用，则并发逐期查询001~当前。
+            if not reached:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                # 当前期号从数据库、Telegram、专用当前接口中取最大值；最低先补到300，接口不存在的会快速失败。
+                ds0=draws(); nums=[int(d['issue'][-3:]) for d in ds0 if d['issue'].startswith(target) and d['issue'][-3:].isdigit()]
+                cur=max(nums) if nums else 0
+                cur=max(cur,211)
+                issues=[f'{target}{i:03d}' for i in range(1,cur+1)]
+                with ThreadPoolExecutor(max_workers=24) as ex:
+                    futs=[ex.submit(fetch_issue_api,iss) for iss in issues]
+                    for f in as_completed(futs):
+                        try:
+                            item=f.result()
+                            if item and item[0].startswith(target): save(item[0],item[1])
+                        except Exception: pass
+                ds1=draws()
+                reached=any(d['issue']==target+'001' for d in ds1)
+
+            # ③ 当前专用API作为实时备用；绝不覆盖更新的Telegram数据。
+            curitem=fetch_current_api()
+            if curitem and curitem[0].startswith(target): save(curitem[0],curitem[1])
+
+            # ④ 网页历史页和open_video3最后兜底。
+            if not reached:
+                for page in range(1,101):
+                    got=fetch_history_page(page)
+                    if not got: continue
                     for issue,ns in got:
-                        if issue.startswith(target):
-                            save(issue,ns); got_total += 1
-                        if issue == target+'001': reached=True
+                        if issue.startswith(target): save(issue,ns)
+                        if issue==target+'001': reached=True
                     if reached: break
-                except Exception:
-                    continue
+            if not reached:
+                for url in ['https://macaujc.com/open_video3/','https://r.jina.ai/http://macaujc.com/open_video3/','https://r.jina.ai/https://macaujc.com/open_video3/']:
+                    try:
+                        req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Accept':'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8'})
+                        with urllib.request.urlopen(req,timeout=15) as r: html=r.read().decode('utf-8','ignore')
+                        got=parse_web_history(html) or parse_text_history(html)
+                        for issue,ns in got:
+                            if issue.startswith(target): save(issue,ns)
+                            if issue==target+'001': reached=True
+                        if reached: break
+                    except Exception: continue
         except Exception:
             pass
-        # 抓到001后一分钟检查一次；完全没抓到则15秒重试。
         time.sleep(60 if reached else 15)
-
 
 def cycle_start_for(ds):
  # 本统计周期从当天001期开始；跨日后自动切换到新日期001期。
