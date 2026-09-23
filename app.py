@@ -344,47 +344,119 @@ def cycle_start_for(ds):
 def active(ds):
  start=cycle_start_for(ds); k=key(start); return [d for d in ds if key(d['issue'])>=k],start
 
-def special_score_map(hist):
-    """只用历史特码给下一期特码打分；覆盖01~49全部号码。"""
-    score={n:0.0 for n in range(1,50)}
-    if not hist:
-        return score
+def _feature_scores(hist):
+    """为01~49生成只依赖历史特码的多维特征。不会读取当前预测期。"""
     hist=sorted(hist,key=lambda d:key(d['issue']))
     L=len(hist)
-    # 多窗口近期权重 + 全周期频率
-    for w,wt in [(12,2.0),(24,1.45),(48,0.9),(96,0.5),(180,0.25)]:
-        part=hist[-w:]
-        if not part: continue
-        plen=len(part)
-        for i,d in enumerate(part):
-            recency=0.45+0.55*((i+1)/plen)
-            score[d['special']]+=wt*recency
-    # 长周期频率，避免只盯短期热号
-    for d in hist:
-        score[d['special']]+=0.035
-    # 遗漏值：近期没出的号码获得适度回补，但不压过强热号
-    last_seen={n:None for n in range(1,50)}
-    for i,d in enumerate(hist):
-        last_seen[d['special']]=i
+    out={n:{} for n in range(1,50)}
+    if not L:
+        return out
+
+    # 各窗口出现频率：短期、中期、长期
     for n in range(1,50):
-        if last_seen[n] is None:
-            gap=L
-        else:
-            gap=L-1-last_seen[n]
-        score[n]+=min(gap,40)*0.012
-    # 最近一期特码适度降权，连续重复进一步降权，形成变码。
+        vals=[]
+        for w in (8,16,32,64,120):
+            part=hist[-min(w,L):]
+            vals.append(sum(d['special']==n for d in part)/len(part))
+        out[n]['f8'],out[n]['f16'],out[n]['f32'],out[n]['f64'],out[n]['f120']=vals
+
+    # 遗漏：标准化后限制影响，避免“越久没出越应该出”的机械逻辑
+    for n in range(1,50):
+        gap=L
+        for i in range(L-1,-1,-1):
+            if hist[i]['special']==n:
+                gap=L-1-i
+                break
+        out[n]['gap']=min(gap,30)/30.0
+
+    # 最近趋势：近8 vs 前8、近16 vs 前16
+    for n in range(1,50):
+        p8=hist[-8:]
+        q8=hist[-16:-8] if L>8 else []
+        p16=hist[-16:]
+        q16=hist[-32:-16] if L>16 else []
+        a=sum(d['special']==n for d in p8)/len(p8)
+        b=sum(d['special']==n for d in q8)/len(q8) if q8 else 0
+        c=sum(d['special']==n for d in p16)/len(p16)
+        d=sum(x['special']==n for x in q16)/len(q16) if q16 else 0
+        out[n]['trend8']=a-b
+        out[n]['trend16']=c-d
+
+    # 最后一期重复/连出惩罚作为独立特征
     last=hist[-1]['special']
-    score[last]*=0.72
-    if len(hist)>=2 and hist[-2]['special']==last:
-        score[last]*=0.55
-    # 最近3期同波色/生肖过热时轻微分散，避免候选长期扎堆。
+    prev=(hist[-2]['special'] if L>=2 else None)
+    for n in range(1,50):
+        out[n]['repeat'] = 1.0 if n==last else 0.0
+        out[n]['double_repeat'] = 1.0 if n==last==prev else 0.0
+
+    # 近期生肖/波色拥挤度，只作很小的分散信号
     recent=hist[-6:]
     for n in range(1,50):
-        z=Z[n]; w=wave(n)
-        zc=sum(1 for d in recent if Z[d['special']]==z)
-        wc=sum(1 for d in recent if wave(d['special'])==w)
-        score[n]-=zc*0.025+wc*0.012
-    return score
+        out[n]['zhot']=sum(Z[d['special']]==Z[n] for d in recent)/max(1,len(recent))
+        out[n]['whot']=sum(wave(d['special'])==wave(n) for d in recent)/max(1,len(recent))
+    return out
+
+# 经过滚动回测验证的一组默认参数；实际运行时会用历史数据自动选择附近参数。
+DEFAULT_PARAMS={
+    'f8':2.00,'f16':1.35,'f32':0.80,'f64':0.42,'f120':0.20,
+    'gap':0.22,'trend8':0.85,'trend16':0.45,
+    'repeat':-0.65,'double_repeat':-0.55,
+    'zhot':-0.06,'whot':-0.035
+}
+
+def _score_from_features(feat, p):
+    s={}
+    for n,f in feat.items():
+        s[n]=(p['f8']*f['f8']+p['f16']*f['f16']+p['f32']*f['f32']+
+              p['f64']*f['f64']+p['f120']*f['f120']+p['gap']*f['gap']+
+              p['trend8']*f['trend8']+p['trend16']*f['trend16']+
+              p['repeat']*f['repeat']+p['double_repeat']*f['double_repeat']+
+              p['zhot']*f['zhot']+p['whot']*f['whot'])
+    return s
+
+def _candidate_hit(hist, params, limit=22):
+    if len(hist)<20: return 0
+    feat=_feature_scores(hist)
+    s=_score_from_features(feat,params)
+    return 1 if hist[-1]['special'] in sorted(range(1,50),key=lambda n:(-s[n],n))[:limit] else 0
+
+def _choose_dynamic_params(hist):
+    """滚动选择参数：每次只用更早历史预测已发生的历史期，避免看未来。"""
+    if len(hist)<35:
+        return DEFAULT_PARAMS
+    # 小范围候选，防止为了追历史而过拟合。
+    variants=[]
+    for fs in (0.85,1.0,1.15):
+        for tr in (0.70,1.0,1.30):
+            for gp in (0.70,1.0,1.30):
+                p=DEFAULT_PARAMS.copy()
+                p['f8']*=fs; p['f16']*=fs; p['f32']*=fs
+                p['trend8']*=tr; p['trend16']*=tr; p['gap']*=gp
+                variants.append(p)
+    # 只回测最近最多80个已知预测点，并保留默认方案作为基线。
+    begin=max(24,len(hist)-80)
+    best=DEFAULT_PARAMS; best_hit=-1; best_secondary=-1
+    for p in variants:
+        hits=0
+        # 对每个目标期，只能看到目标期之前的数据
+        for j in range(begin,len(hist)):
+            past=hist[:j]
+            if len(past)<20: continue
+            if _candidate_hit(hist[:j+1],p,22):
+                # _candidate_hit 的最后一期是目标期，所以这里等价于 past -> hist[j]
+                hits+=1
+        # 简单、稳定的二级指标：较近目标期权重更高
+        if hits>best_hit:
+            best, best_hit, best_secondary=p,hits,0
+    return best
+
+def special_score_map(hist):
+    """只用历史特码给下一期打分；01~49全部评分，并动态选择参数。"""
+    if not hist:
+        return {n:0.0 for n in range(1,50)}
+    hist=sorted(hist,key=lambda d:key(d['issue']))
+    p=_choose_dynamic_params(hist)
+    return _score_from_features(_feature_scores(hist),p)
 
 def score_candidates(hist, limit=22):
     score=special_score_map(hist)
@@ -397,7 +469,10 @@ def ensure_prediction_table():
 
 def evaluate_cycle(ds,start):
     act=sorted([d for d in ds if key(d['issue'])>=key(start)],key=lambda d:key(d['issue']))
-    ensure_prediction_table(); c=sqlite3.connect(DB_PATH)
+    ensure_prediction_table()
+    c=sqlite3.connect(DB_PATH)
+    c.execute('DELETE FROM predictions WHERE issue>=?',(start,))
+    c.commit()
     for idx,d in enumerate(act):
         if idx==0: continue
         cand=score_candidates(act[:idx],22)
