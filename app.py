@@ -18,13 +18,15 @@ def init():
   c.execute("DELETE FROM draws WHERE issue LIKE ? AND COALESCE(source,'legacy') <> 'telegram'",(today+'%',))
   c.execute("UPDATE draws SET source='legacy' WHERE source IS NULL OR source='web'")
   c.commit(); c.close()
-def save(issue,nums,source='web',force=False):
+def save(issue,nums,source='telegram',force=False):
  if len(nums)!=7 or len(set(nums))<7 or not all(1<=n<=49 for n in nums): return
+ # 开奖数据唯一来源：Telegram 机器人。
+ if source != 'telegram': return
  c=sqlite3.connect(DB_PATH)
- # 数据源优先级：机器人 > 3分彩API > 网页 > 旧数据。
+ # 只保留 Telegram 机器人数据，不接受外部来源覆盖。
  try: c.execute("ALTER TABLE draws ADD COLUMN source TEXT DEFAULT 'legacy'")
  except Exception: pass
- pri={'legacy':0,'web':1,'api':2,'telegram':3}
+ pri={'telegram':3}
  row=c.execute('SELECT source FROM draws WHERE issue=?',(issue,)).fetchone()
  # 机器人一旦收到某一期，后续任何API/网页数据都不能覆盖它。
  if row and pri.get(source,1) < pri.get(row[0] or 'legacy',0):
@@ -264,9 +266,72 @@ def fetch_current_api():
     return None
 
 def web_backfill():
- # 不再读取任何 API/官网历史；历史只来自 Telegram 机器人导入。
- while True:
-  time.sleep(3600)
+    """严格按本周期001→当前期补齐；只有完整连续历史才用于预测。"""
+    while True:
+        try:
+            target=datetime.now(BJ).strftime('%Y%m%d')
+            # 当前期优先相信机器人：机器人已收到的最新期号就是主进度。
+            # 只有机器人尚无当天数据时，才退回3分彩专用API确定当前期。
+            ds0=draws()
+            bot_nums=[int(d['issue'][-3:]) for d in ds0 if d['issue'].startswith(target) and d['issue'][-3:].isdigit() and d.get('source')=='telegram']
+            curitem=fetch_current_api()
+            api_num=int(curitem[0][-3:]) if curitem and curitem[0].startswith(target) else 0
+            current_num=max(bot_nums) if bot_nums else api_num
+            if curitem and curitem[0].startswith(target): save(curitem[0],curitem[1],source='api',force=True)
+
+            # 历史接口只作为辅助源；机器人已经收到的期号和号码绝不覆盖。
+            got=fetch_api_history(datetime.now(BJ).year)
+            for issue,ns in got:
+                if issue.startswith(target) and issue[-3:].isdigit() and int(issue[-3:]) <= current_num:
+                    save(issue,ns,source='api',force=True)
+            for page in range(1,61):
+                got=fetch_history_page(page)
+                for issue,ns in got:
+                    if issue.startswith(target) and issue[-3:].isdigit() and int(issue[-3:]) <= current_num:
+                        save(issue,ns,source='web',force=True)
+
+            # 再检查数据库，确定应该补到哪里。
+            ds=draws()
+            nums=sorted({int(d['issue'][-3:]) for d in ds if d['issue'].startswith(target) and d['issue'][-3:].isdigit()})
+            # 机器人是当前期主源；无机器人数据时才使用3分彩专用API。
+            if current_num<=0:
+                time.sleep(15)
+                continue
+            # 删除任何超过真源当前期号的当天记录，防止旧错误数据再次进入预测。
+            c=sqlite3.connect(DB_PATH)
+            c.execute("DELETE FROM draws WHERE issue LIKE ? AND CAST(substr(issue,9,3) AS INTEGER)>?",(target+'%',current_num))
+            c.commit(); c.close()
+            expected=set(range(1,current_num+1))
+            have=set(nums)
+            missing=sorted(expected-have)
+
+            # 只补缺号；避免每分钟重复请求全部历史。
+            if missing:
+               from concurrent.futures import ThreadPoolExecutor, as_completed
+               with ThreadPoolExecutor(max_workers=20) as ex:
+                   futs={ex.submit(fetch_issue_api,f'{target}{i:03d}'):i for i in missing}
+                   for f in as_completed(futs):
+                       try:
+                           item=f.result()
+                           if item and item[0].startswith(target): save(item[0],item[1],source='api',force=True)
+                       except Exception:
+                           pass
+
+            # 最后再扫一次页面；仍然严格限制在当前接口确认的期号以内。
+            for page in range(1,61):
+                got=fetch_history_page(page)
+                for issue,ns in got:
+                    if issue.startswith(target) and issue[-3:].isdigit() and int(issue[-3:]) <= current_num:
+                         save(issue,ns,source='web',force=True)
+
+            # 连续性状态由页面读取；如果001~当前全齐，就进入60秒检查，否则15秒重试。
+            ds=draws()
+            have2={int(d['issue'][-3:]) for d in ds if d['issue'].startswith(target) and d['issue'][-3:].isdigit()}
+            complete=current_num>0 and all(i in have2 for i in range(1,current_num+1))
+            time.sleep(60 if complete else 15)
+        except Exception:
+            time.sleep(15)
+
 
 def cycle_start_for(ds):
  # 本统计周期从当天001期开始；跨日后自动切换到新日期001期。
@@ -364,79 +429,13 @@ def data():
     zrank.sort(key=lambda x:(-x[1],x[0])); top=zrank[:5]
     stats=evaluate_cycle(act,start)
     history=[{'issue':d['issue'],'numbers':[pack(n) for n in d['numbers']],'special':pack(d['special']),'time':d['received_at']} for d in sorted(act,key=lambda d:key(d['issue']),reverse=True)]
-    return jsonify({'latest':({'issue':latest['issue'],'time':latest['received_at'],'numbers':[pack(n) for n in latest['numbers']],'special':pack(latest['special'])} if latest else None),'candidates':[pack(n) for n in sorted(cand)],'copy':','.join(f'{n:02d}' for n in sorted(cand)),'candidate_zodiacs':[{'zodiac':z,'numbers':[f'{n:02d}' for n in best]} for z,_,best in top],'active_count':len(act),'cycle_start':start,'stats':stats,'history':history,'data_status':{'total':len(ds),'today':len(act),'earliest':(sorted(ds,key=lambda d:key(d['issue']))[0]['issue'] if ds else None),'latest':(ds[0]['issue'] if ds else None)}})
+    return jsonify({'latest':({'issue':latest['issue'],'time':latest['received_at'],'numbers':[pack(n) for n in latest['numbers']],'special':pack(latest['special'])} if latest else None),'candidates':[pack(n) for n in sorted(cand)],'copy':','.join(f'{n:02d}' for n in sorted(cand)),'candidate_zodiacs':[{'zodiac':z,'numbers':[f'{n:02d}' for n in best]} for z,_,best in top],'active_count':len(act),'cycle_start':start,'stats':stats,'history':history,'data_status':{'source':'telegram','total':len(ds),'today':len(act),'earliest':(sorted(ds,key=lambda d:key(d['issue']))[0]['issue'] if ds else None),'latest':(ds[0]['issue'] if ds else None)}})
 
-
-# 用户导入的 Telegram 机器人历史记录：只作为机器人历史种子，不调用外部开奖源。
-TELEGRAM_HISTORY_SEED=[
- ('20260923151',[8, 47, 17, 40, 48, 18, 45]),
- ('20260923152',[21, 35, 15, 5, 40, 10, 44]),
- ('20260923153',[48, 31, 10, 24, 15, 47, 38]),
- ('20260923154',[2, 46, 12, 15, 25, 19, 9]),
- ('20260923155',[12, 31, 36, 33, 25, 38, 15]),
- ('20260923156',[8, 47, 25, 40, 10, 24, 46]),
- ('20260923157',[6, 27, 5, 45, 12, 15, 23]),
- ('20260923158',[34, 32, 8, 5, 24, 35, 19]),
- ('20260923159',[43, 37, 49, 48, 2, 11, 30]),
- ('20260923160',[18, 16, 22, 25, 1, 46, 5]),
- ('20260923161',[47, 15, 20, 34, 26, 25, 30]),
- ('20260923162',[10, 36, 28, 42, 41, 4, 12]),
- ('20260923163',[1, 44, 20, 47, 41, 42, 31]),
- ('20260923164',[46, 32, 44, 38, 43, 8, 2]),
- ('20260923165',[2, 48, 42, 33, 4, 34, 28]),
- ('20260923166',[23, 20, 26, 18, 27, 45, 24]),
- ('20260923167',[1, 42, 24, 21, 13, 26, 30]),
- ('20260923168',[39, 7, 27, 46, 8, 21, 14]),
- ('20260923169',[39, 35, 37, 15, 38, 12, 21]),
- ('20260923170',[22, 24, 3, 37, 39, 18, 35]),
- ('20260923172',[40, 49, 17, 1, 42, 41, 13]),
- ('20260923179',[25, 45, 23, 41, 13, 24, 8]),
- ('20260923180',[3, 38, 12, 25, 16, 14, 28]),
- ('20260923181',[28, 41, 5, 45, 9, 30, 39]),
- ('20260923182',[7, 20, 43, 34, 33, 19, 24]),
- ('20260923183',[13, 7, 9, 27, 4, 14, 32]),
- ('20260923184',[9, 12, 2, 32, 5, 27, 48]),
- ('20260923185',[48, 12, 40, 1, 49, 16, 37]),
- ('20260923186',[46, 20, 17, 10, 5, 13, 49]),
- ('20260923187',[9, 28, 34, 7, 15, 41, 46]),
- ('20260923188',[15, 6, 45, 43, 12, 38, 27]),
- ('20260923189',[13, 48, 37, 24, 44, 36, 8]),
- ('20260923190',[47, 11, 22, 26, 28, 14, 16]),
- ('20260923191',[47, 13, 17, 34, 21, 49, 12]),
- ('20260923192',[10, 14, 27, 22, 23, 42, 44]),
- ('20260923193',[32, 47, 31, 6, 10, 2, 11]),
- ('20260923194',[28, 49, 12, 37, 31, 24, 20]),
- ('20260923195',[26, 27, 37, 34, 17, 46, 48]),
- ('20260923196',[20, 22, 41, 28, 5, 44, 33]),
- ('20260923198',[8, 20, 9, 48, 43, 49, 16]),
- ('20260923199',[17, 34, 24, 47, 5, 33, 28]),
- ('20260923200',[5, 48, 17, 31, 42, 16, 37]),
- ('20260923201',[5, 32, 9, 14, 34, 26, 10]),
- ('20260923202',[10, 13, 6, 32, 21, 35, 1]),
- ('20260923203',[28, 41, 47, 9, 17, 45, 6]),
- ('20260923204',[8, 20, 23, 1, 33, 37, 17]),
- ('20260923205',[27, 34, 21, 16, 45, 49, 13]),
- ('20260923206',[39, 49, 42, 36, 45, 43, 6]),
- ('20260923207',[3, 28, 9, 27, 29, 11, 7]),
- ('20260923208',[13, 47, 40, 16, 10, 38, 37]),
- ('20260923209',[49, 39, 2, 38, 25, 22, 35]),
- ('20260923210',[7, 4, 42, 44, 8, 11, 18]),
- ('20260923213',[20, 8, 46, 37, 43, 9, 7]),
- ('20260923215',[47, 16, 28, 33, 49, 8, 18]),
- ('20260923217',[2, 32, 20, 9, 13, 45, 44]),
- ('20260923220',[47, 18, 12, 10, 26, 48, 19]),
- ('20260923226',[35, 49, 40, 31, 17, 16, 27]),
- ('20260923234',[39, 3, 17, 40, 16, 24, 49]),
-]
-def seed_telegram_history():
- for issue,nums in TELEGRAM_HISTORY_SEED:
-  save(issue,nums,source='telegram')
-
-# Gunicorn 启动时必须主动启动 Telegram 监听。
+# Gunicorn 启动时必须主动启动 Telegram 与历史补抓线程。
 # 之前漏掉这一步会导致网页能打开，但开奖和历史都不会更新。
 init()
 ensure_prediction_table()
-seed_telegram_history()
 threading.Thread(target=tg,daemon=True).start()
+# 不启动任何网页/API历史补抓；历史数据只来自 Telegram 机器人。
 
 HTML='''<!doctype html><html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><title>澳门六合彩·3分</title><style>body{margin:0;background:#f4f7fb;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;color:#15233d}.head{background:#123f82;color:#fff;padding:14px}.wrap{max-width:900px;margin:auto;padding:10px}.card{background:#fff;border-radius:16px;padding:14px;margin-bottom:10px;box-shadow:0 4px 18px #17345a12}.row{display:flex;justify-content:space-between;align-items:center;gap:8px}.title{font-size:18px;font-weight:800}.muted{color:#78879c;font-size:12px}.status{background:#eaffef;color:#087d31;border-radius:18px;padding:6px 9px;font-size:12px}.latest{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}.ball{width:40px;height:40px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:900;border:2px solid}.red{color:#d71919;border-color:#ef4141;background:#fff1f1}.blue{color:#125de2;border-color:#2174ee;background:#eef5ff}.green{color:#129344;border-color:#20a453;background:#effbf3}.meta{text-align:center;font-size:10px;font-weight:700;margin-top:2px}.copy{background:#1667e8;color:#fff;border:0;border-radius:10px;padding:8px 11px;font-size:13px;font-weight:800}.nums{color:#084fe0;font-size:18px;font-weight:900;line-height:1.45;margin:8px 0;word-break:break-all}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:7px}.tile{text-align:center;border:1px solid #dfe6f0;border-radius:11px;padding:7px 2px}.n{font-size:18px;font-weight:900}.zgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:7px}.z{text-align:center;border:1px solid #ddd;border-radius:11px;padding:8px 3px}.zname{font-size:16px;font-weight:900}.znums{font-size:12px;color:#64748b;margin-top:3px;font-weight:800}.note{background:#eff6ff;border-radius:10px;padding:8px;color:#637795;font-size:11px;margin-top:8px}.hist{display:flex;flex-direction:column;gap:6px}.hrow{display:grid;grid-template-columns:72px 1fr 45px;align-items:center;border-bottom:1px solid #edf1f6;padding:5px 0;font-size:12px}.hnums{font-weight:800;letter-spacing:.3px}.hspec{font-weight:900;text-align:right}@media(max-width:650px){.grid{grid-template-columns:repeat(5,1fr)}.zgrid{grid-template-columns:repeat(3,1fr)}} </style><body><div class="head"><div class="row"><div><b>澳门六合彩 · 3分</b><div style="font-size:12px">实时开奖 · 下一期开奖结果预测</div></div><div class="status">🟢 实时接收</div></div></div><div class="wrap"><div class="card"><div class="row"><div class="title">最新开奖</div><div id="time" class="muted"></div></div><div id="issue" class="muted"></div><div id="latest" class="latest"></div></div><div class="card"><div class="row"><div><div class="title">⭐ 下一期预测特码</div><div class="muted">用最新一期之前的全部历史数据，01～49全部评分后取最高22码</div></div><button class="copy" onclick="cp()">复制22码</button></div><div id="nums" class="nums"></div><div id="grid" class="grid"></div><div id="stats" class="note"></div></div><div class="card"><div class="title">⭐ 下一期预测生肖</div><div class="muted">独立评分；每个生肖最多显示2个预测号码（号码来自22码）</div><div id="zgrid" class="zgrid" style="margin-top:8px"></div></div><div class="card"><div class="title">📜 本周期全部历史开奖</div><div class="muted" id="hcount"></div><div id="hist" class="hist" style="margin-top:6px"></div></div></div><script>let cpv='';function wc(w){return w[0]=='红'?'red':w[0]=='蓝'?'blue':'green'}function render(d){document.querySelector('#time').textContent=d.latest?new Date(d.latest.time).toLocaleString('zh-CN',{hour12:false}):'';document.querySelector('#issue').textContent=d.latest?'第'+d.latest.issue+'期':('等待历史数据抓取…（当前0期）');let h='';if(d.latest){for(const x of d.latest.numbers)h+=`<div><div class="ball ${wc(x.wave)}">${x.number}</div><div class="meta ${wc(x.wave)}">${x.zodiac}·${x.wave}</div></div>`;const x=d.latest.special;h+=`<div><div class="ball ${wc(x.wave)}">${x.number}</div><div class="meta ${wc(x.wave)}">${x.zodiac}·${x.wave}<br>特码</div></div>`}document.querySelector('#latest').innerHTML=h;cpv=d.copy;document.querySelector('#nums').textContent=d.copy;document.querySelector('#stats').innerHTML=`本周期：${d.cycle_start}　已开奖：${d.stats.cycle_draw_count}期　已回测：${d.stats.evaluated_count}期　命中：${d.stats.hit_periods}期　错误：${d.stats.miss_periods}期　历史命中率：${d.stats.hit_rate}%　累计命中：${d.stats.total_hits}次`;document.querySelector('#grid').innerHTML=d.candidates.map(x=>`<div class="tile"><div class="n ${wc(x.wave)}">${x.number}</div><div class="meta ${wc(x.wave)}">${x.zodiac}·${x.wave}</div></div>`).join('');document.querySelector('#zgrid').innerHTML=d.candidate_zodiacs.map(x=>`<div class="z"><div class="zname">${x.zodiac}</div><div class="znums">${x.numbers.join('、')}</div></div>`).join('');document.querySelector('#hcount').textContent='共'+d.history.length+'期（从'+d.cycle_start+'开始）';document.querySelector('#hist').innerHTML=d.history.map(r=>{let ns=r.numbers.map(x=>`<span class="smallball ${wc(x.wave)}">${x.number}</span>`).join(' ');return `<div class="hrow"><div>${r.issue.slice(-3)}期</div><div class="hnums">${ns}</div><div class="hspec ${wc(r.special.wave)}">+${r.special.number}</div></div>`}).join('')}async function load(){try{const r=await fetch('/api/data?x='+Date.now());if(!r.ok)throw new Error('API '+r.status);render(await r.json())}catch(e){document.querySelector('#issue').textContent='数据读取中…';}}async function cp(){try{await navigator.clipboard.writeText(cpv);alert('已复制：'+cpv)}catch(e){prompt('复制下面号码：',cpv)}}load();setInterval(load,15000)</script></body></html>'''
