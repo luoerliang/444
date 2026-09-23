@@ -33,38 +33,44 @@ def tg():
   except Exception: time.sleep(5)
 
 def parse_web_history(html):
-    """尽量宽松地解析历史页：一期必须得到期号 + 7个1~49号码。"""
+    """稳健解析3分彩历史页：按表格行识别期号，并从该行末尾提取7个开奖号码。"""
     out=[]
-    rows=re.findall(r'<tr[^>]*>(.*?)</tr>',html,re.I|re.S)
+    rows=re.findall(r'<tr[^>]*>(.*?)</tr>', html or '', re.I|re.S)
     if not rows:
-        rows=re.split(r'(?=20\d{9}\b)',html)
+        rows=re.split(r'(?=20\d{9}\b)', html or '')
     for row in rows:
+        # 保留单元格边界，避免把日期/时间里的数字当开奖号码
+        cells=re.findall(r'<(?:td|th)[^>]*>(.*?)</(?:td|th)>', row, re.I|re.S)
         txt=re.sub(r'<script[^>]*>.*?</script>|<style[^>]*>.*?</style>',' ',row,flags=re.I|re.S)
         txt=re.sub(r'<[^>]+>',' ',txt)
         txt=re.sub(r'&nbsp;|&#160;',' ',txt)
         txt=re.sub(r'\s+',' ',txt).strip()
         im=re.search(r'\b(20\d{9})\b',txt)
-        if not im:
-            continue
+        if not im: continue
         issue=im.group(1)
-        # 优先取期号之后的文本；把日期、时间中的数字排除，再取7个1~49号码。
-        rest=txt[im.end():]
-        rest=re.sub(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}:\d{2}',' ',rest)
-        tokens=re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',rest)
-        ns=[]
-        for x in tokens:
-            n=int(x)
-            if 1<=n<=49:
-                ns.append(n)
-        # 某些页面把号码藏在前面的列里，再从整行补一次。
-        if len(ns)<7:
-            allnums=[int(x) for x in re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',txt)]
-            ns=[n for n in allnums if n not in [int(issue[:8]), int(issue[8:])]]
-        # 一期只能接受7个不同号码，避免把期号/时间误当号码。
-        if len(ns)>=7:
-            ns=ns[:7]
-            if len(set(ns))==7:
-                out.append((issue,ns))
+        nums=[]
+        # 优先逐td读取：期号/时间/号码通常分别在独立单元格。
+        for cell in cells:
+            ct=re.sub(r'<[^>]+>',' ',cell)
+            ct=re.sub(r'&nbsp;|&#160;',' ',ct)
+            ct=re.sub(r'\s+',' ',ct).strip()
+            # 过滤日期和时间单元格
+            if re.search(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}',ct) or re.fullmatch(r'\d{1,2}:\d{2}(?::\d{2})?',ct):
+                continue
+            vals=re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',ct)
+            for v in vals:
+                n=int(v)
+                if n not in nums: nums.append(n)
+        # 若td结构不规则，取整行中最后7个唯一号码；时间/期号在前面，不影响末尾号码。
+        if len(nums)<7:
+            vals=re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',txt)
+            nums=[]
+            for v in vals:
+                n=int(v)
+                if n not in nums: nums.append(n)
+            if len(nums)>=7: nums=nums[-7:]
+        if len(nums)==7 and len(set(nums))==7:
+            out.append((issue,nums))
     seen=set(); clean=[]
     for x in out:
         if x[0] not in seen:
@@ -72,37 +78,24 @@ def parse_web_history(html):
     return clean
 
 def fetch_history_page(page):
-    """抓取3分彩历史页。/macaujc3/才是3分彩历史，不再使用macaujc2。"""
+    """3分彩历史页多种分页参数兜底。"""
     urls=[
-        f'https://macaujc.com/macaujc3/?page={page}',
         f'https://macaujc.com/macaujc3/?id=3&page={page}',
-        f'https://macaujc.com/macaujc3/index.php?page={page}',
-        f'https://macaujc.com/macaujc3/index.php?id=3&page={page}',
-        f'https://r.jina.ai/http://macaujc.com/macaujc3/?page={page}',
-        f'https://r.jina.ai/https://macaujc.com/macaujc3/?page={page}',
+        f'https://macaujc.com/macaujc3/?page={page}',
+        f'https://macaujc.com/macaujc3/?id=3&p={page}',
+        f'https://macaujc.com/macaujc3/?id=3&pageNum={page}',
+        f'https://macaujc.com/macaujc3/?id=3&currentPage={page}',
         f'https://r.jina.ai/http://macaujc.com/macaujc3/?id=3&page={page}',
         f'https://r.jina.ai/https://macaujc.com/macaujc3/?id=3&page={page}',
     ]
     for url in urls:
         try:
-            req=urllib.request.Request(url,headers={
-                'User-Agent':'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Safari/605.1',
-                'Accept':'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
-                'Accept-Language':'zh-CN,zh;q=0.9'
-            })
-            with urllib.request.urlopen(req,timeout=20) as r:
-                html=r.read().decode('utf-8','ignore')
-            got=parse_web_history(html)
-            if got:
-                return got
-            # 有些代理把页面转成纯文本，继续尝试宽松的文本解析。
-            got=parse_text_history(html)
-            if got:
-                return got
-        except Exception:
-            continue
+            req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Safari/605.1','Accept':'text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8','Accept-Language':'zh-CN,zh;q=0.9'})
+            with urllib.request.urlopen(req,timeout=18) as r: html=r.read().decode('utf-8','ignore')
+            got=parse_web_history(html) or parse_text_history(html)
+            if got: return got
+        except Exception: continue
     return []
-
 
 def parse_text_history(text):
     """解析被代理/JS转换成纯文本的历史记录。"""
@@ -240,15 +233,18 @@ def web_backfill():
             curitem=fetch_current_api()
             if curitem and curitem[0].startswith(target): save(curitem[0],curitem[1])
 
-            # ④ 网页历史页和open_video3最后兜底。
-            if not reached:
-                for page in range(1,101):
-                    got=fetch_history_page(page)
-                    if not got: continue
-                    for issue,ns in got:
-                        if issue.startswith(target): save(issue,ns)
-                        if issue==target+'001': reached=True
-                    if reached: break
+            # ④ 网页历史分页：必须尽量扫完，不因为先遇到001或重复页就提前结束。
+            # 目的：补齐001~当前，而不是只拿到页面里能解析的几条。
+            seen_page_keys=set()
+            for page in range(1,101):
+                got=fetch_history_page(page)
+                if not got: continue
+                page_key=tuple(sorted(x[0] for x in got))
+                if page_key in seen_page_keys: continue
+                seen_page_keys.add(page_key)
+                for issue,ns in got:
+                    if issue.startswith(target): save(issue,ns)
+                if any(x[0]==target+'001' for x in got): reached=True
             if not reached:
                 for url in ['https://macaujc.com/open_video3/','https://r.jina.ai/http://macaujc.com/open_video3/','https://r.jina.ai/https://macaujc.com/open_video3/']:
                     try:
@@ -262,7 +258,7 @@ def web_backfill():
                     except Exception: continue
         except Exception:
             pass
-        time.sleep(60 if reached else 15)
+        time.sleep(30 if reached else 10)
 
 def cycle_start_for(ds):
  # 本统计周期从当天001期开始；跨日后自动切换到新日期001期。
