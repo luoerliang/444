@@ -13,25 +13,26 @@ def init():
   try:
    c.execute("ALTER TABLE draws ADD COLUMN source TEXT DEFAULT 'legacy'")
   except Exception: pass
-  # 清掉当前日期旧版本记录，避免错误特码继续留在数据库；随后按真源重新抓取。
+  # 保留机器人已经收到的当天开奖结果；只清理当天非机器人旧数据，避免错误特码残留。
   today=datetime.now(BJ).strftime('%Y%m%d')
-  c.execute("DELETE FROM draws WHERE issue LIKE ?",(today+'%',))
+  c.execute("DELETE FROM draws WHERE issue LIKE ? AND COALESCE(source,'legacy') <> 'telegram'",(today+'%',))
   c.execute("UPDATE draws SET source='legacy' WHERE source IS NULL OR source='web'")
   c.commit(); c.close()
 def save(issue,nums,source='web',force=False):
  if len(nums)!=7 or len(set(nums))<7 or not all(1<=n<=49 for n in nums): return
  c=sqlite3.connect(DB_PATH)
- # 旧版本没有 source 字段，先补上。来源优先级：api > telegram > web。
+ # 数据源优先级：机器人 > 3分彩API > 网页 > 旧数据。
  try: c.execute("ALTER TABLE draws ADD COLUMN source TEXT DEFAULT 'legacy'")
  except Exception: pass
- pri={'legacy':0,'web':1,'telegram':2,'api':3}
+ pri={'legacy':0,'web':1,'api':2,'telegram':3}
  row=c.execute('SELECT source FROM draws WHERE issue=?',(issue,)).fetchone()
- if row and not force and pri.get(source,1) < pri.get(row[0] or 'web',1):
+ # 机器人一旦收到某一期，后续任何API/网页数据都不能覆盖它。
+ if row and pri.get(source,1) < pri.get(row[0] or 'legacy',0):
   c.close(); return
  c.execute('INSERT OR REPLACE INTO draws(issue,numbers,special,received_at,source) VALUES(?,?,?,?,?)',(issue,','.join(map(str,nums[:6])),nums[6],datetime.now(BJ).isoformat(),source))
  c.commit(); c.close()
 def draws():
- c=sqlite3.connect(DB_PATH); rows=c.execute('SELECT issue,numbers,special,received_at FROM draws ORDER BY issue DESC').fetchall(); c.close(); return [{'issue':i,'numbers':[int(x) for x in ns.split(',')],'special':sp,'received_at':t} for i,ns,sp,t in rows]
+ c=sqlite3.connect(DB_PATH); rows=c.execute("SELECT issue,numbers,special,received_at,COALESCE(source,'legacy') FROM draws ORDER BY issue DESC").fetchall(); c.close(); return [{'issue':i,'numbers':[int(x) for x in ns.split(',')],'special':sp,'received_at':t,'source':src} for i,ns,sp,t,src in rows]
 def parse(t):
  m=re.search(r'(?:澳门六合彩3分彩\s*[:：]\s*)?(\d{9,})\s*期?开奖结果?\s*[:：]\s*([0-9０-９,，、\s]+)',t or '')
  if not m:return
@@ -267,12 +268,16 @@ def web_backfill():
     while True:
         try:
             target=datetime.now(BJ).strftime('%Y%m%d')
-            # 先用当前接口确定真正的当前期，不再写死211。
+            # 当前期优先相信机器人：机器人已收到的最新期号就是主进度。
+            # 只有机器人尚无当天数据时，才退回3分彩专用API确定当前期。
+            ds0=draws()
+            bot_nums=[int(d['issue'][-3:]) for d in ds0 if d['issue'].startswith(target) and d['issue'][-3:].isdigit() and d.get('source')=='telegram']
             curitem=fetch_current_api()
-            current_num=int(curitem[0][-3:]) if curitem and curitem[0].startswith(target) else 0
+            api_num=int(curitem[0][-3:]) if curitem and curitem[0].startswith(target) else 0
+            current_num=max(bot_nums) if bot_nums else api_num
             if curitem and curitem[0].startswith(target): save(curitem[0],curitem[1],source='api',force=True)
 
-            # 历史接口只作为辅助源；任何超过当前接口确认期号的记录一律拒绝。
+            # 历史接口只作为辅助源；机器人已经收到的期号和号码绝不覆盖。
             got=fetch_api_history(datetime.now(BJ).year)
             for issue,ns in got:
                 if issue.startswith(target) and issue[-3:].isdigit() and int(issue[-3:]) <= current_num:
@@ -286,8 +291,14 @@ def web_backfill():
             # 再检查数据库，确定应该补到哪里。
             ds=draws()
             nums=sorted({int(d['issue'][-3:]) for d in ds if d['issue'].startswith(target) and d['issue'][-3:].isdigit()})
-            if nums: current_num=max(current_num,max(nums))
-            if current_num<=0: current_num=1
+            # 机器人是当前期主源；无机器人数据时才使用3分彩专用API。
+            if current_num<=0:
+                time.sleep(15)
+                continue
+            # 删除任何超过真源当前期号的当天记录，防止旧错误数据再次进入预测。
+            c=sqlite3.connect(DB_PATH)
+            c.execute("DELETE FROM draws WHERE issue LIKE ? AND CAST(substr(issue,9,3) AS INTEGER)>?",(target+'%',current_num))
+            c.commit(); c.close()
             expected=set(range(1,current_num+1))
             have=set(nums)
             missing=sorted(expected-have)
