@@ -1,17 +1,12 @@
-澳门六合彩3分分析 fixed26
+第16版基础改进版：fixed28
 
-Render:
-Build Command: pip install -r requirements.txt
-Start Command: gunicorn app:app
-Environment Variable:
-TELEGRAM_BOT_TOKEN=你的机器人Token
+保留第16版的预测评分与回测命中率逻辑，不删已有数据库历史。
+内置用户已提供的机器人历史作为首次启动种子；Telegram 新开奖优先级最高，收到后覆盖同一期种子数据，但不会删除其它历史。
 
-这版：
-1. 只接收 Telegram 机器人开奖数据作为实时主源。
-2. 已内置当前已提供的机器人历史种子（含去重后的58期，最新217期）。
-3. 历史6个平码严格保持机器人原始顺序，只有预测22码按01-49升序。
-4. 特码预测只使用历史特码评分；生肖预测独立计算，每个生肖最多2个号码。
-5. 启动时自动建库、导入历史、启动 Telegram 长轮询，并清理旧 webhook（不丢待处理消息）。
-6. /health 可检查服务是否运行。
+Render：Build = pip install -r requirements.txt
+Start = gunicorn app:app
+环境变量：TELEGRAM_BOT_TOKEN（使用你原来的机器人 Token）
 
-注意：Render 免费实例可能休眠；手机熄屏不会直接停止服务器，但免费实例是否持续运行由 Render 平台决定。
+部署后：
+/health 可查看 total、latest、telegram_configured。
+网页每15秒刷新。
