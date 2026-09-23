@@ -1,12 +1,19 @@
-第16版基础改进版：fixed28
+第16版基础·固定历史不删版·动态预测改进版29
 
-保留第16版的预测评分与回测命中率逻辑，不删已有数据库历史。
-内置用户已提供的机器人历史作为首次启动种子；Telegram 新开奖优先级最高，收到后覆盖同一期种子数据，但不会删除其它历史。
+核心原则：
+1. 不删除数据库已有历史；启动只做“缺失期号补种”，已有 Telegram 数据优先级最高。
+2. 随包保留完整 history_seed.csv（14,343期）+ 58 条已收机器人种子，合并后共14,401期已知历史。
+3. 历史开奖6个平码严格保持原始顺序；特码独立显示在 + 后。只有预测候选码按01→49升序显示。
+4. 预测只用历史特码评分，不把6个平码混入特码预测。
+5. 预测候选码动态19～23码：每期根据最新评分分差自动变化，不再固定23码。
+6. 复制按钮只复制预测数字，并且严格从小到大，例如 01,03,07,18...。
+7. 特肖改成独立模型：近期频率、遗漏、生肖转移、近期过热惩罚分开计算；前5个生肖，每个2个号码，避免长期固定“马”。
+8. 机器人接收支持 message/channel_post/edited_message/edited_channel_post 及 caption。
+9. 已做最新800期回测（含机器人种子）：19码38.75%、20码41.25%、21码43.50%、22码45.62%、23码47.12%；动态19～23码为46.50%。这些只是历史回测，不代表下一期结果，也不保证命中。
 
-Render：Build = pip install -r requirements.txt
-Start = gunicorn app:app
-环境变量：TELEGRAM_BOT_TOKEN（使用你原来的机器人 Token）
+部署：
+Build: pip install -r requirements.txt
+Start: gunicorn app:app
+环境变量：TELEGRAM_BOT_TOKEN
 
-部署后：
-/health 可查看 total、latest、telegram_configured。
-网页每15秒刷新。
+注意：历史数据文件必须随 app.py 一起上传。不要删除 history_seed.csv / robot_seed.json。
