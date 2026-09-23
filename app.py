@@ -86,9 +86,8 @@ def init():
   try:
    c.execute("ALTER TABLE draws ADD COLUMN source TEXT DEFAULT 'legacy'")
   except Exception: pass
-  # 保留机器人已经收到的当天开奖结果；只清理当天非机器人旧数据，避免错误特码残留。
-  today=datetime.now(BJ).strftime('%Y%m%d')
-  c.execute("DELETE FROM draws WHERE issue LIKE ? AND COALESCE(source,'legacy') <> 'telegram'",(today+'%',))
+  # 绝不删除线上已有历史。fixed16/旧版本的历史即使 source 为 legacy，也必须完整保留。
+  # 后续只允许 Telegram 新数据写入/更新，避免任何启动清理误删历史。
   c.execute("UPDATE draws SET source='legacy' WHERE source IS NULL OR source='web'")
   c.commit(); c.close()
 def save(issue,nums,source='telegram',force=False):
