@@ -1,13 +1,17 @@
-澳门六合彩3分分析
-
-关键修复：
-1. 专用3分彩 API 优先：macaumarksix.com/api/macaujc3.com
-2. API 数据优先级高于网页解析，避免网页解析覆盖正确特码。
-3. 每期第1-6个号码严格保持官网/API开出顺序，不排序。
-4. 第7个号码单独作为特码保存。
-5. 历史网页/逐期接口用于补齐历史，保留API正确记录。
-6. 预测候选号码可排序，但历史开奖号码绝不排序。
+澳门六合彩3分分析 fixed26
 
 Render:
-Build: pip install -r requirements.txt
-Start: gunicorn app:app
+Build Command: pip install -r requirements.txt
+Start Command: gunicorn app:app
+Environment Variable:
+TELEGRAM_BOT_TOKEN=你的机器人Token
+
+这版：
+1. 只接收 Telegram 机器人开奖数据作为实时主源。
+2. 已内置当前已提供的机器人历史种子（含去重后的58期，最新217期）。
+3. 历史6个平码严格保持机器人原始顺序，只有预测22码按01-49升序。
+4. 特码预测只使用历史特码评分；生肖预测独立计算，每个生肖最多2个号码。
+5. 启动时自动建库、导入历史、启动 Telegram 长轮询，并清理旧 webhook（不丢待处理消息）。
+6. /health 可检查服务是否运行。
+
+注意：Render 免费实例可能休眠；手机熄屏不会直接停止服务器，但免费实例是否持续运行由 Render 平台决定。

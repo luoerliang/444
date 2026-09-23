@@ -114,6 +114,11 @@ def parse(t):
  return (m.group(1),ns[:7]) if len(ns)>=7 else None
 def tg():
  if not BOT_TOKEN:return
+ # 确保 Telegram 轮询可用：清掉旧 webhook，但不丢弃待处理消息。
+ try:
+  req=urllib.request.Request(f'https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook?drop_pending_updates=false')
+  urllib.request.urlopen(req,timeout=10).read()
+ except Exception: pass
  off=0
  while True:
   try:
@@ -598,6 +603,9 @@ def evaluate_cycle(ds,start):
     return model_for(hist)['stats']
 
 def pack(n):return {'number':f'{n:02d}','zodiac':Z[n],'wave':wave(n)}
+@app.get('/health')
+def health(): return jsonify({'ok':True,'service':'macau3','latest':(draws()[0]['issue'] if draws() else None)})
+
 @app.get('/')
 def home(): return render_template_string(HTML)
 @app.get('/api/data')
