@@ -25,7 +25,7 @@ def save(issue,nums,source="telegram"):
     issue=str(issue)
     nums=[int(x) for x in nums]
     if len(nums)!=7 or len(set(nums))<7 or not all(1<=x<=49 for x in nums): return
-    pri={"legacy":0,"seed":1,"telegram":3}
+    pri={"legacy":0,"seed":1,"web":2,"api":2,"telegram":3}
     c=sqlite3.connect(DB_PATH)
     row=c.execute("SELECT source FROM draws WHERE issue=?",(issue,)).fetchone()
     if row and pri.get(source,1)<pri.get(row[0] or "legacy",0):
@@ -57,6 +57,18 @@ def import_seeds():
         try:
             for issue,nums in json.load(open(p,"r",encoding="utf-8")).items():
                 save("20260923"+str(int(issue)).zfill(3),nums,"seed")
+        except Exception: pass
+
+def ensure_seed_data():
+    """只补缺，不删除数据库；Render重启后即使SQLite为空也会自动恢复随包历史。"""
+    try:
+        c=sqlite3.connect(DB_PATH)
+        n=c.execute("SELECT COUNT(*) FROM draws").fetchone()[0]
+        c.close()
+        if n==0:
+            import_seeds()
+    except Exception:
+        try: import_seeds()
         except Exception: pass
 
 def parse_tg(text):
@@ -136,23 +148,22 @@ def score(hist):
     return s
 
 def choose_count(hist,s):
-    """根据评分分差动态选择19～23码：分数越接近越放宽，分层越明显越收窄。"""
+    """第16版基础的动态码数：最多22码；分差明显时收窄，接近时放宽。
+    号码本身始终按评分从01~49重新排名，绝不固定01~22。
+    """
     if not hist:return 22
     ranked=sorted(range(1,50),key=lambda n:(-s[n],n)); vals=[s[n] for n in ranked]
-    mu=sum(vals)/49; sd=max((sum((x-mu)**2 for x in vals)/49)**0.5,.0001)
-    gap=(vals[18]-vals[22])/sd
+    mu=sum(vals)/49
+    sd=max((sum((x-mu)**2 for x in vals)/49)**0.5,.0001)
+    gap=(vals[19]-vals[21])/sd
     diversity=len(set(hist[-24:]))/max(1,min(24,len(hist)))
-    if gap < 0.25:
-        k=23
-    elif gap < 0.50:
+    if gap < 0.28:
         k=22
-    elif gap < 0.80:
+    elif gap < 0.60:
         k=21
-    elif gap < 1.05:
-        k=20 if diversity<0.75 else 21
     else:
-        k=19 if diversity<0.70 else 20
-    return max(19,min(23,k))
+        k=20 if diversity<0.72 else 21
+    return max(20,min(22,k))
 
 def zodiac_prediction(hist,s):
     """独立生肖模型：近期、遗漏、转移、热度分开评分；每个生肖显示2个号码。"""
@@ -225,7 +236,7 @@ body{margin:0;background:#f4f7fb;color:#15233d;font-family:-apple-system,BlinkMa
 </style><body><div class="head"><div class="row"><div><b>澳门六合彩 · 3分</b><div style="font-size:12px">全历史回测 · 下一期动态预测</div></div><div id="status" class="status">读取中</div></div></div>
 <div class="wrap">
 <div class="card"><div class="row"><div><div class="title">最新开奖</div><div id="issue" class="muted"></div></div><div id="time" class="muted"></div></div><div id="latest" class="latest"></div></div>
-<div class="card"><div class="row"><div><div class="title">⭐ 下一期预测特码</div><div class="muted">全部历史特码参与评分；动态19～23码（每期自动变码）</div></div><button class="copy" onclick="cp()">复制预测码</button></div><div id="nums" class="nums"></div><div id="grid" class="grid"></div><div id="stats" class="note"></div></div>
+<div class="card"><div class="row"><div><div class="title">⭐ 下一期预测特码</div><div class="muted">全部历史特码参与评分；动态20～22码（每期自动变码）</div></div><button class="copy" onclick="cp()">复制预测码</button></div><div id="nums" class="nums"></div><div id="grid" class="grid"></div><div id="stats" class="note"></div></div>
 <div class="card"><div class="title">⭐ 下一期预测生肖</div><div class="muted">独立评分；前5个生肖，每个2个号码</div><div id="zgrid" class="zgrid" style="margin-top:8px"></div></div>
 <div class="card"><div class="row"><div><div class="title">📜 全部历史开奖</div><div class="muted" id="hcount"></div></div><button class="copy" onclick="location.href='/api/history.csv'">导出全部</button></div><div id="hist" style="margin-top:6px"></div><button id="more" class="more" onclick="more()">加载更多历史</button></div>
 </div>
@@ -247,7 +258,7 @@ function render(d){
  document.querySelector("#grid").innerHTML=d.candidates.map(x=>`<div class="tile"><div class="n ${wc(x.wave)}">${x.number}</div><div class="meta ${wc(x.wave)}">${x.zodiac}·${x.wave}</div></div>`).join("");
  document.querySelector("#zgrid").innerHTML=d.candidate_zodiacs.map(x=>`<div class="z"><div class="zname">${x.zodiac}</div><div class="znums">${x.numbers.join("、")}</div></div>`).join("");
  const r=d.stats;
- document.querySelector("#stats").innerHTML=`全历史${r.history_count||d.data_status.total}期；已回测${r.evaluated_count||0}期。19码 ${r.hit_rates?.["19"]??"-"}%　20码 ${r.hit_rates?.["20"]??"-"}%　21码 ${r.hit_rates?.["21"]??"-"}%　22码 ${r.hit_rates?.["22"]??"-"}%　23码 ${r.hit_rates?.["23"]??"-"}%。<br>本期动态预测：${d.candidate_count}码；号码每期按最新历史重新评分并变动。仅作历史统计参考，不代表下一期结果。`;
+ document.querySelector("#stats").innerHTML=`全历史${r.history_count||d.data_status.total}期；已回测${r.evaluated_count||0}期。19码 ${r.hit_rates?.["19"]??"-"}%　20码 ${r.hit_rates?.["20"]??"-"}%　21码 ${r.hit_rates?.["21"]??"-"}%　22码 ${r.hit_rates?.["22"]??"-"}%。<br>本期动态预测：${d.candidate_count}码；号码每期按最新历史重新评分并变动。仅作历史统计参考，不代表下一期结果。`;
  document.querySelector("#hcount").textContent="数据库共"+d.history.length+"期；历史开奖原顺序保留";
  shown=0;document.querySelector("#hist").innerHTML="";more();
 }
@@ -266,6 +277,7 @@ def home(): return render_template_string(HTML)
 
 @app.get("/health")
 def health():
+    ensure_seed_data()
     d=draws()
     return jsonify({"ok":True,"total":len(d),"latest":d[-1]["issue"] if d else None,"telegram_configured":bool(BOT_TOKEN)})
 
@@ -278,15 +290,14 @@ def history_csv():
 
 @app.get("/api/data")
 def data():
+    ensure_seed_data()
     ds=draws()
     specials=[d["special"] for d in ds]
     s=score(specials) if specials else {}
     order=sorted(range(1,50),key=lambda n:(-s[n],n)) if specials else []
-    # 依据全历史回测的长度选择：当前缓存中23码覆盖率最高，未来仍限制在19～23。
+    # 每次开奖后都用当前全部历史重新评分；码数动态20~22，最多22码。
     stats=cache()
-    k=23
-    if stats.get("hit_rates"):
-        k=max(range(19,24),key=lambda x:(float(stats["hit_rates"].get(str(x),0))-0.003*(x-19),-x))
+    k=choose_count(specials,s) if specials else 22
     cand=sorted(order[:k])
     zpred=zodiac_prediction(specials,s) if specials else []
     latest=ds[-1] if ds else None
@@ -303,4 +314,5 @@ def data():
 
 init()
 import_seeds()
+ensure_seed_data()
 threading.Thread(target=tg,daemon=True).start()
