@@ -13,8 +13,8 @@ THREE_MIN_PAGE = 'https://macaujc.com/macaujc3/'
 THREE_MIN_LIVE = 'https://macaujc.com/open_video3/'
 # The site's public API page documents these endpoints, but its examples are ordinary Macau Mark Six.
 # We only accept API records whose issue looks like the 3-minute format (YYYYMMDD + 3 digits).
-LATEST_API = 'https://macaumarksix.com/api/macaujc3.com'
-HISTORY_API = 'https://history.macaumarksix.com/history/macaujc3/expect/{}'
+LATEST_API = 'https://macaumarksix.com/api/macaujc2.com'
+HISTORY_API = 'https://history.macaumarksix.com/history/macaujc2/expect/{}'
 READER = 'https://r.jina.ai/http://macaujc.com/macaujc3/'
 
 HTML = r'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
@@ -74,14 +74,13 @@ def nums7(value):
     return out[:7] if len(out)>=7 else None
 
 
-def add(found, issue, dt, nums, special=None, priority=50):
+def add(found, issue, dt, nums, special=None):
     issue=issue_ok(issue); nums=nums7(nums)
     if not issue or not dt or not nums or len(nums)!=7: return
+    # Never silently replace a clearly supplied special with an arbitrary 7th token.
     sp = int(special) if str(special).isdigit() and 1<=int(special)<=49 else nums[6]
     nums = nums[:6] + [sp]
-    old=found.get(issue)
-    if old is None or priority >= old[4]:
-        found[issue]=(issue,str(dt).strip(),nums,sp,priority)
+    found[issue]=(issue,str(dt).strip(),nums,sp)
 
 
 def parse_json_obj(obj, found):
@@ -96,14 +95,14 @@ def parse_json_obj(obj, found):
         dt=it.get('openTime') or it.get('open_time') or it.get('drawTime')
         code=it.get('openCode') or it.get('open_code') or it.get('numbers')
         if issue and dt and code:
-            add(found,issue,dt,code,priority=100)
+            add(found,issue,dt,code)
 
 
 def parse_json_text(text, found):
     try: parse_json_obj(json.loads(text),found); return
     except Exception: pass
     for m in re.finditer(r'\{[^{}]{0,3000}"(?:expect|issue)"\s*:\s*"?([0-9]{10,})"?.{0,2500}?"(?:openCode|open_code)"\s*:\s*"([^"]+)".{0,1500}?"(?:openTime|open_time)"\s*:\s*"([^"]+)"',text,re.S):
-        add(found,m.group(1),m.group(3),m.group(2),priority=100)
+        add(found,m.group(1),m.group(3),m.group(2))
 
 
 def parse_html(raw, found):
@@ -119,7 +118,7 @@ def parse_html(raw, found):
         dt=next((re.search(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?',c) for c in cells if re.search(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}',c)),None)
         if not dt: continue
         nums=nums7(' '.join(cells[2:]))
-        if nums: add(found,issue,dt.group(0),nums,priority=50)
+        if nums: add(found,issue,dt.group(0),nums)
     text=' '.join(soup.stripped_strings).replace('\xa0',' ')
     matches=list(re.finditer(r'第\s*(\d{10,})\s*期',text))
     for i,m in enumerate(matches):
@@ -131,7 +130,7 @@ def parse_html(raw, found):
         sm=re.search(r'(?:特碼|特码)\s*[:：]?\s*(?:[^0-9]{0,40})((?:0?[1-9]|[1-4]\d))',tail)
         special=int(sm.group(1)) if sm else None
         ns=nums7(tail)
-        if ns: add(found,m.group(1),dt.group(1),ns,special,priority=50)
+        if ns: add(found,m.group(1),dt.group(1),ns,special)
 
 
 def get(url):
@@ -141,7 +140,7 @@ def get(url):
 
 def collect():
     found={}; errors=[]
-    # 1) Use the dedicated 3-minute API first; API records have highest priority.
+    # 1) Try the documented API, but reject ordinary 7-digit Macau Mark Six records.
     try:
         r=get(LATEST_API); parse_json_text(r.text,found)
     except Exception as e: errors.append('latest-api: '+str(e))
@@ -154,7 +153,7 @@ def collect():
     try:
         r=get(READER); parse_html(r.text,found)
     except Exception as e: errors.append('reader: '+str(e))
-    # 4) Fill nearby missing issues from the dedicated by-issue endpoint.
+    # 4) If we found a 3-minute issue, ask the documented by-issue endpoint for nearby 3-minute issues.
     if found:
         latest=max(found, key=lambda x: (found[x][1],x))
         m=re.match(r'(\d{8})(\d{3})$',latest)
@@ -173,7 +172,7 @@ def collect():
 def save(found):
     now=datetime.utcnow().isoformat(timespec='seconds')
     with sqlite3.connect(DB) as c:
-        for issue,dt,nums,sp,_priority in found.values():
+        for issue,dt,nums,sp in found.values():
             c.execute('''INSERT INTO draws(issue,draw_time,numbers,special,updated_at) VALUES(?,?,?,?,?)
                          ON CONFLICT(issue) DO UPDATE SET draw_time=excluded.draw_time,numbers=excluded.numbers,special=excluded.special,updated_at=excluded.updated_at''',
                       (issue,dt,json.dumps(nums),sp,now))
