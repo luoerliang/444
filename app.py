@@ -33,61 +33,101 @@ def tg():
   except Exception: time.sleep(5)
 
 def parse_web_history(html):
-    # 兼容官方页不同日期格式、表格/普通文本结构。
+    """尽量宽松地解析历史页：一期必须得到期号 + 7个1~49号码。"""
     out=[]
     rows=re.findall(r'<tr[^>]*>(.*?)</tr>',html,re.I|re.S)
     if not rows:
-        rows=re.split(r'(?=<\d{11}\b)',html)
+        rows=re.split(r'(?=20\d{9}\b)',html)
     for row in rows:
         txt=re.sub(r'<script[^>]*>.*?</script>|<style[^>]*>.*?</style>',' ',row,flags=re.I|re.S)
         txt=re.sub(r'<[^>]+>',' ',txt)
         txt=re.sub(r'&nbsp;|&#160;',' ',txt)
         txt=re.sub(r'\s+',' ',txt).strip()
         im=re.search(r'\b(20\d{9})\b',txt)
-        if not im: continue
+        if not im:
+            continue
         issue=im.group(1)
-        # 先找开奖时间；支持 2026-09-23 / 2026/9/23 等写法。
-        tm=re.search(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}:\d{2}',txt)
-        rest=txt[tm.end():] if tm else txt[im.end():]
-        # 去掉常见的期号/日期数字干扰，只在后续文本里找 01-49。
-        ns=[int(x) for x in re.findall(r'(?<!\d)(0[1-9]|[1-4]\d|49)(?!\d)',rest)]
+        # 优先取期号之后的文本；把日期、时间中的数字排除，再取7个1~49号码。
+        rest=txt[im.end():]
+        rest=re.sub(r'20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}:\d{2}',' ',rest)
+        tokens=re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',rest)
+        ns=[]
+        for x in tokens:
+            n=int(x)
+            if 1<=n<=49:
+                ns.append(n)
+        # 某些页面把号码藏在前面的列里，再从整行补一次。
+        if len(ns)<7:
+            allnums=[int(x) for x in re.findall(r'(?<!\d)(0?[1-9]|[1-4]\d|49)(?!\d)',txt)]
+            ns=[n for n in allnums if n not in [int(issue[:8]), int(issue[8:])]]
+        # 一期只能接受7个不同号码，避免把期号/时间误当号码。
         if len(ns)>=7:
             ns=ns[:7]
             if len(set(ns))==7:
                 out.append((issue,ns))
-    # 去重，保留第一次出现
     seen=set(); clean=[]
     for x in out:
         if x[0] not in seen:
             seen.add(x[0]); clean.append(x)
     return clean
 
+def fetch_history_page(page):
+    urls=[
+        f'https://maoaujc.com/macaujc2//?id=3&page={page}',
+        f'https://maoaujc.com/macaujc2/?id=3&page={page}',
+        f'https://maoaujc.com/?id=3&page={page}',
+        f'http://maoaujc.com/macaujc2//?id=3&page={page}',
+        f'https://r.jina.ai/http://maoaujc.com/macaujc2//?id=3&page={page}',
+        f'https://r.jina.ai/http://maoaujc.com/macaujc2/?id=3&page={page}',
+    ]
+    for url in urls:
+        try:
+            req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'})
+            with urllib.request.urlopen(req,timeout=25) as r:
+                html=r.read().decode('utf-8','ignore')
+            got=parse_web_history(html)
+            if got:
+                return got
+        except Exception:
+            continue
+    return []
+
 def web_backfill():
+    # 每轮从第1页开始向旧页连续翻页，直到找到当天001期。
+    # 允许到100页，避免只停在146/150附近。
     while True:
         try:
-            target=datetime.now(BJ).strftime('%Y%m%d'); reached=False
-            for page in range(1,13):
-                for url in [f'https://maoaujc.com/macaujc2//?id=3&page={page}',f'http://maoaujc.com/macaujc2//?id=3&page={page}',f'https://r.jina.ai/http://maoaujc.com/macaujc2//?id=3&page={page}']:
-                    try:
-                        req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'})
-                        with urllib.request.urlopen(req,timeout=20) as r: html=r.read().decode('utf-8','ignore')
-                        got=parse_web_history(html)
-                        for issue,ns in got:
-                            if issue.startswith(target): save(issue,ns)
-                            if issue==target+'001': reached=True
-                        if got: break
-                    except Exception: continue
-                if reached: break
+            target=datetime.now(BJ).strftime('%Y%m%d')
+            reached=False
+            empty_streak=0
+            for page in range(1,101):
+                got=fetch_history_page(page)
+                if not got:
+                    empty_streak+=1
+                    if empty_streak>=5:
+                        break
+                    continue
+                empty_streak=0
+                for issue,ns in got:
+                    if issue.startswith(target):
+                        save(issue,ns)
+                    if issue==target+'001':
+                        reached=True
+                if reached:
+                    break
+            # 实时展示页作为补充，只保存当天数据。
             for url in ['https://macaujc.com/open_video3/','https://r.jina.ai/http://macaujc.com/open_video3/']:
                 try:
                     req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'})
-                    with urllib.request.urlopen(req,timeout=20) as r: html=r.read().decode('utf-8','ignore')
+                    with urllib.request.urlopen(req,timeout=25) as r: html=r.read().decode('utf-8','ignore')
                     for issue,ns in parse_web_history(html):
                         if issue.startswith(target): save(issue,ns)
                     break
-                except Exception: continue
-        except Exception: pass
-        time.sleep(30)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        time.sleep(20 if not reached else 60)
 
 def cycle_start_for(ds):
  # 本统计周期从当天001期开始；跨日后自动切换到新日期001期。
@@ -101,29 +141,52 @@ def active(ds):
  start=cycle_start_for(ds); k=key(start); return [d for d in ds if key(d['issue'])>=k],start
 
 def special_score_map(hist):
-    if not hist:return {n:0.0 for n in range(1,50)}
-    hist=sorted(hist,key=lambda d:key(d['issue']))
+    """只用历史特码给下一期特码打分；覆盖01~49全部号码。"""
     score={n:0.0 for n in range(1,50)}
-    for w,wt in [(12,1.25),(24,0.95),(48,0.65),(96,0.35)]:
+    if not hist:
+        return score
+    hist=sorted(hist,key=lambda d:key(d['issue']))
+    L=len(hist)
+    # 多窗口近期权重 + 全周期频率
+    for w,wt in [(12,2.0),(24,1.45),(48,0.9),(96,0.5),(180,0.25)]:
         part=hist[-w:]
         if not part: continue
-        L=len(part)
+        plen=len(part)
         for i,d in enumerate(part):
-            weight=wt*(0.35+0.65*((i+1)/L))
-            score[d['special']]+=weight
-    for d in hist: score[d['special']]+=0.025
-    seen={d['special'] for d in hist[-18:]}
+            recency=0.45+0.55*((i+1)/plen)
+            score[d['special']]+=wt*recency
+    # 长周期频率，避免只盯短期热号
+    for d in hist:
+        score[d['special']]+=0.035
+    # 遗漏值：近期没出的号码获得适度回补，但不压过强热号
+    last_seen={n:None for n in range(1,50)}
+    for i,d in enumerate(hist):
+        last_seen[d['special']]=i
     for n in range(1,50):
-        if n not in seen: score[n]+=0.12
-    if hist:
-        score[hist[-1]['special']]*=0.82
-        if len(hist)>=2 and hist[-2]['special']==hist[-1]['special']:
-            score[hist[-1]['special']]*=0.72
+        if last_seen[n] is None:
+            gap=L
+        else:
+            gap=L-1-last_seen[n]
+        score[n]+=min(gap,40)*0.012
+    # 最近一期特码适度降权，连续重复进一步降权，形成变码。
+    last=hist[-1]['special']
+    score[last]*=0.72
+    if len(hist)>=2 and hist[-2]['special']==last:
+        score[last]*=0.55
+    # 最近3期同波色/生肖过热时轻微分散，避免候选长期扎堆。
+    recent=hist[-6:]
+    for n in range(1,50):
+        z=Z[n]; w=wave(n)
+        zc=sum(1 for d in recent if Z[d['special']]==z)
+        wc=sum(1 for d in recent if wave(d['special'])==w)
+        score[n]-=zc*0.025+wc*0.012
     return score
 
 def score_candidates(hist, limit=22):
     score=special_score_map(hist)
-    return sorted(range(1,50),key=lambda n:(-score[n],n))[:limit]
+    # 对01~49全部评分后取最高，不是固定01~22。
+    ranked=sorted(range(1,50),key=lambda n:(-score[n],n))
+    return ranked[:limit]
 
 def ensure_prediction_table():
  c=sqlite3.connect(DB_PATH); c.execute('CREATE TABLE IF NOT EXISTS predictions(issue TEXT PRIMARY KEY,candidates TEXT,created_at TEXT,hit_count INTEGER,hit INTEGER)'); c.commit(); c.close()
@@ -148,10 +211,17 @@ def data():
     hist=sorted(act,key=lambda d:key(d['issue']))
     cand=score_candidates(hist,22) if hist else []
     scores=special_score_map(hist)
+    # 生肖单独评分，但最终号码必须来自22码；每肖最多2个。
     zrank=[]
+    recent=hist[-24:]
     for z in set(Z.values()):
-        zn=sorted([n for n in cand if Z[n]==z],key=lambda n:(-scores[n],n))[:2]
-        if zn: zrank.append((z,sum(scores[n] for n in zn),zn))
+        members=[n for n in cand if Z[n]==z]
+        if not members: continue
+        zhist=sum(1 for d in recent if Z[d['special']]==z)
+        # 生肖层面稍看近期冷/热，再在该肖内部取分最高2码。
+        zn=sorted(members,key=lambda n:(-(scores[n]+min(zhist,8)*0.03),n))[:2]
+        zscore=sum(scores[n] for n in zn)+(0.03*min(zhist,8))
+        zrank.append((z,zscore,zn))
     zrank.sort(key=lambda x:(-x[1],x[0])); top=zrank[:5]
     stats=evaluate_cycle(act,start)
     history=[{'issue':d['issue'],'numbers':[pack(n) for n in d['numbers']],'special':pack(d['special']),'time':d['received_at']} for d in sorted(act,key=lambda d:key(d['issue']),reverse=True)]
@@ -164,4 +234,4 @@ ensure_prediction_table()
 threading.Thread(target=tg,daemon=True).start()
 threading.Thread(target=web_backfill,daemon=True).start()
 
-HTML='''<!doctype html><html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><title>澳门六合彩·3分</title><style>body{margin:0;background:#f4f7fb;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;color:#15233d}.head{background:#123f82;color:#fff;padding:14px}.wrap{max-width:900px;margin:auto;padding:10px}.card{background:#fff;border-radius:16px;padding:14px;margin-bottom:10px;box-shadow:0 4px 18px #17345a12}.row{display:flex;justify-content:space-between;align-items:center;gap:8px}.title{font-size:18px;font-weight:800}.muted{color:#78879c;font-size:12px}.status{background:#eaffef;color:#087d31;border-radius:18px;padding:6px 9px;font-size:12px}.latest{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}.ball{width:40px;height:40px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:900;border:2px solid}.red{color:#d71919;border-color:#ef4141;background:#fff1f1}.blue{color:#125de2;border-color:#2174ee;background:#eef5ff}.green{color:#129344;border-color:#20a453;background:#effbf3}.meta{text-align:center;font-size:10px;font-weight:700;margin-top:2px}.copy{background:#1667e8;color:#fff;border:0;border-radius:10px;padding:8px 11px;font-size:13px;font-weight:800}.nums{color:#084fe0;font-size:18px;font-weight:900;line-height:1.45;margin:8px 0;word-break:break-all}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:7px}.tile{text-align:center;border:1px solid #dfe6f0;border-radius:11px;padding:7px 2px}.n{font-size:18px;font-weight:900}.zgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:7px}.z{text-align:center;border:1px solid #ddd;border-radius:11px;padding:8px 3px}.zname{font-size:16px;font-weight:900}.znums{font-size:12px;color:#64748b;margin-top:3px;font-weight:800}.note{background:#eff6ff;border-radius:10px;padding:8px;color:#637795;font-size:11px;margin-top:8px}.hist{display:flex;flex-direction:column;gap:6px}.hrow{display:grid;grid-template-columns:72px 1fr 45px;align-items:center;border-bottom:1px solid #edf1f6;padding:5px 0;font-size:12px}.hnums{font-weight:800;letter-spacing:.3px}.hspec{font-weight:900;text-align:right}@media(max-width:650px){.grid{grid-template-columns:repeat(5,1fr)}.zgrid{grid-template-columns:repeat(3,1fr)}} </style><body><div class="head"><div class="row"><div><b>澳门六合彩 · 3分</b><div style="font-size:12px">实时开奖 · 下一期开奖结果预测</div></div><div class="status">🟢 实时接收</div></div></div><div class="wrap"><div class="card"><div class="row"><div class="title">最新开奖</div><div id="time" class="muted"></div></div><div id="issue" class="muted"></div><div id="latest" class="latest"></div></div><div class="card"><div class="row"><div><div class="title">⭐ 下一期预测特码</div><div class="muted">用最新一期之前的全部历史数据，最多22码</div></div><button class="copy" onclick="cp()">复制22码</button></div><div id="nums" class="nums"></div><div id="grid" class="grid"></div><div id="stats" class="note"></div></div><div class="card"><div class="title">⭐ 下一期预测生肖</div><div class="muted">独立评分；每个生肖只显示2个预测号码</div><div id="zgrid" class="zgrid" style="margin-top:8px"></div></div><div class="card"><div class="title">📜 本周期全部历史开奖</div><div class="muted" id="hcount"></div><div id="hist" class="hist" style="margin-top:6px"></div></div></div><script>let cpv='';function wc(w){return w[0]=='红'?'red':w[0]=='蓝'?'blue':'green'}function render(d){document.querySelector('#time').textContent=d.latest?new Date(d.latest.time).toLocaleString('zh-CN',{hour12:false}):'';document.querySelector('#issue').textContent=d.latest?'第'+d.latest.issue+'期':'等待开奖';let h='';if(d.latest){for(const x of d.latest.numbers)h+=`<div><div class="ball ${wc(x.wave)}">${x.number}</div><div class="meta ${wc(x.wave)}">${x.zodiac}·${x.wave}</div></div>`;const x=d.latest.special;h+=`<div><div class="ball ${wc(x.wave)}">${x.number}</div><div class="meta ${wc(x.wave)}">${x.zodiac}·${x.wave}<br>特码</div></div>`}document.querySelector('#latest').innerHTML=h;cpv=d.copy;document.querySelector('#nums').textContent=d.copy;document.querySelector('#stats').innerHTML=`本周期：${d.cycle_start}　已开奖：${d.stats.cycle_draw_count}期　已回测：${d.stats.evaluated_count}期　命中：${d.stats.hit_periods}期　错误：${d.stats.miss_periods}期　历史命中率：${d.stats.hit_rate}%　累计命中：${d.stats.total_hits}次`;document.querySelector('#grid').innerHTML=d.candidates.map(x=>`<div class="tile"><div class="n ${wc(x.wave)}">${x.number}</div><div class="meta ${wc(x.wave)}">${x.zodiac}·${x.wave}</div></div>`).join('');document.querySelector('#zgrid').innerHTML=d.candidate_zodiacs.map(x=>`<div class="z"><div class="zname">${x.zodiac}</div><div class="znums">${x.numbers.join('、')}</div></div>`).join('');document.querySelector('#hcount').textContent='共'+d.history.length+'期（从'+d.cycle_start+'开始）';document.querySelector('#hist').innerHTML=d.history.map(r=>{let ns=r.numbers.map(x=>`<span class="smallball ${wc(x.wave)}">${x.number}</span>`).join(' ');return `<div class="hrow"><div>${r.issue.slice(-3)}期</div><div class="hnums">${ns}</div><div class="hspec ${wc(r.special.wave)}">+${r.special.number}</div></div>`}).join('')}async function load(){try{const r=await fetch('/api/data?x='+Date.now());if(!r.ok)throw new Error('API '+r.status);render(await r.json())}catch(e){document.querySelector('#issue').textContent='数据读取中…';}}async function cp(){try{await navigator.clipboard.writeText(cpv);alert('已复制：'+cpv)}catch(e){prompt('复制下面号码：',cpv)}}load();setInterval(load,15000)</script></body></html>'''
+HTML='''<!doctype html><html lang="zh-CN"><meta name="viewport" content="width=device-width,initial-scale=1"><title>澳门六合彩·3分</title><style>body{margin:0;background:#f4f7fb;font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;color:#15233d}.head{background:#123f82;color:#fff;padding:14px}.wrap{max-width:900px;margin:auto;padding:10px}.card{background:#fff;border-radius:16px;padding:14px;margin-bottom:10px;box-shadow:0 4px 18px #17345a12}.row{display:flex;justify-content:space-between;align-items:center;gap:8px}.title{font-size:18px;font-weight:800}.muted{color:#78879c;font-size:12px}.status{background:#eaffef;color:#087d31;border-radius:18px;padding:6px 9px;font-size:12px}.latest{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}.ball{width:40px;height:40px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:900;border:2px solid}.red{color:#d71919;border-color:#ef4141;background:#fff1f1}.blue{color:#125de2;border-color:#2174ee;background:#eef5ff}.green{color:#129344;border-color:#20a453;background:#effbf3}.meta{text-align:center;font-size:10px;font-weight:700;margin-top:2px}.copy{background:#1667e8;color:#fff;border:0;border-radius:10px;padding:8px 11px;font-size:13px;font-weight:800}.nums{color:#084fe0;font-size:18px;font-weight:900;line-height:1.45;margin:8px 0;word-break:break-all}.grid{display:grid;grid-template-columns:repeat(6,1fr);gap:7px}.tile{text-align:center;border:1px solid #dfe6f0;border-radius:11px;padding:7px 2px}.n{font-size:18px;font-weight:900}.zgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:7px}.z{text-align:center;border:1px solid #ddd;border-radius:11px;padding:8px 3px}.zname{font-size:16px;font-weight:900}.znums{font-size:12px;color:#64748b;margin-top:3px;font-weight:800}.note{background:#eff6ff;border-radius:10px;padding:8px;color:#637795;font-size:11px;margin-top:8px}.hist{display:flex;flex-direction:column;gap:6px}.hrow{display:grid;grid-template-columns:72px 1fr 45px;align-items:center;border-bottom:1px solid #edf1f6;padding:5px 0;font-size:12px}.hnums{font-weight:800;letter-spacing:.3px}.hspec{font-weight:900;text-align:right}@media(max-width:650px){.grid{grid-template-columns:repeat(5,1fr)}.zgrid{grid-template-columns:repeat(3,1fr)}} </style><body><div class="head"><div class="row"><div><b>澳门六合彩 · 3分</b><div style="font-size:12px">实时开奖 · 下一期开奖结果预测</div></div><div class="status">🟢 实时接收</div></div></div><div class="wrap"><div class="card"><div class="row"><div class="title">最新开奖</div><div id="time" class="muted"></div></div><div id="issue" class="muted"></div><div id="latest" class="latest"></div></div><div class="card"><div class="row"><div><div class="title">⭐ 下一期预测特码</div><div class="muted">用最新一期之前的全部历史数据，01～49全部评分后取最高22码</div></div><button class="copy" onclick="cp()">复制22码</button></div><div id="nums" class="nums"></div><div id="grid" class="grid"></div><div id="stats" class="note"></div></div><div class="card"><div class="title">⭐ 下一期预测生肖</div><div class="muted">独立评分；每个生肖最多显示2个预测号码（号码来自22码）</div><div id="zgrid" class="zgrid" style="margin-top:8px"></div></div><div class="card"><div class="title">📜 本周期全部历史开奖</div><div class="muted" id="hcount"></div><div id="hist" class="hist" style="margin-top:6px"></div></div></div><script>let cpv='';function wc(w){return w[0]=='红'?'red':w[0]=='蓝'?'blue':'green'}function render(d){document.querySelector('#time').textContent=d.latest?new Date(d.latest.time).toLocaleString('zh-CN',{hour12:false}):'';document.querySelector('#issue').textContent=d.latest?'第'+d.latest.issue+'期':'等待开奖';let h='';if(d.latest){for(const x of d.latest.numbers)h+=`<div><div class="ball ${wc(x.wave)}">${x.number}</div><div class="meta ${wc(x.wave)}">${x.zodiac}·${x.wave}</div></div>`;const x=d.latest.special;h+=`<div><div class="ball ${wc(x.wave)}">${x.number}</div><div class="meta ${wc(x.wave)}">${x.zodiac}·${x.wave}<br>特码</div></div>`}document.querySelector('#latest').innerHTML=h;cpv=d.copy;document.querySelector('#nums').textContent=d.copy;document.querySelector('#stats').innerHTML=`本周期：${d.cycle_start}　已开奖：${d.stats.cycle_draw_count}期　已回测：${d.stats.evaluated_count}期　命中：${d.stats.hit_periods}期　错误：${d.stats.miss_periods}期　历史命中率：${d.stats.hit_rate}%　累计命中：${d.stats.total_hits}次`;document.querySelector('#grid').innerHTML=d.candidates.map(x=>`<div class="tile"><div class="n ${wc(x.wave)}">${x.number}</div><div class="meta ${wc(x.wave)}">${x.zodiac}·${x.wave}</div></div>`).join('');document.querySelector('#zgrid').innerHTML=d.candidate_zodiacs.map(x=>`<div class="z"><div class="zname">${x.zodiac}</div><div class="znums">${x.numbers.join('、')}</div></div>`).join('');document.querySelector('#hcount').textContent='共'+d.history.length+'期（从'+d.cycle_start+'开始）';document.querySelector('#hist').innerHTML=d.history.map(r=>{let ns=r.numbers.map(x=>`<span class="smallball ${wc(x.wave)}">${x.number}</span>`).join(' ');return `<div class="hrow"><div>${r.issue.slice(-3)}期</div><div class="hnums">${ns}</div><div class="hspec ${wc(r.special.wave)}">+${r.special.number}</div></div>`}).join('')}async function load(){try{const r=await fetch('/api/data?x='+Date.now());if(!r.ok)throw new Error('API '+r.status);render(await r.json())}catch(e){document.querySelector('#issue').textContent='数据读取中…';}}async function cp(){try{await navigator.clipboard.writeText(cpv);alert('已复制：'+cpv)}catch(e){prompt('复制下面号码：',cpv)}}load();setInterval(load,15000)</script></body></html>'''
